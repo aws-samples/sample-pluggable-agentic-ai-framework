@@ -16,7 +16,7 @@ This is sample code for educational purposes. It demonstrates architectural patt
 
 You are the AI architect for AnyCompany, an online retailer. Your mission: build a multi-agent AI system that handles order inquiries and refund processing — all without hardcoding agent endpoints. Specialist agents that are deployed and the orchestrator discovers them dynamically through a centralized registry.
 
-## Architecture Overview
+## Architecture Overview 
 
 The workshop is organized into five layers, each with its own hands-on lab. Security (L4) and observability (L5) are cross-cutting concerns that wrap around the core stack.
 
@@ -134,30 +134,37 @@ pluggable-agentic-ai-framework/
 Each layer publishes resource IDs to SSM that the next layer reads. Run notebooks in this order:
 
 1. `l1-data-knowledge/1_s3_knowledge_base_setup.ipynb`
-2. `l1-data-knowledge/2_dynamodb_tables.ipynb`
-3. `l2-inference/1_pluggable_inference_layer.ipynb`
-4. `l3-orchestration/1_pre-requisites.ipynb`
-5. `l3-orchestration/2_order_agent.ipynb`
-6. `l3-orchestration/3_refund_agent.ipynb`
-7. `l3-orchestration/4_orchestrator_agent.ipynb`
-8. `l3-orchestration/5_chatbot_ui.ipynb` 
-9. `l4-security/1_sensitive_data_masking.ipynb`
-10. `l5-observability/1_end_to_end_tracing.ipynb`
-11. `l5-observability/2_observability_dashboard.ipynb`
+1. `l1-data-knowledge/2_dynamodb_tables.ipynb`
+1. `l2-inference/1_pluggable_inference_layer.ipynb`
+1. `l3-orchestration/1_pre-requisites.ipynb`
+2. `l3-orchestration/2_order_agent.ipynb`
+3. `l3-orchestration/3_refund_agent.ipynb`
+4. `l3-orchestration/4_orchestrator_agent.ipynb`
+5. `l3-orchestration/5_chatbot_ui.ipynb` 
+6. `l4-security/1_sensitive_data_masking.ipynb`
+7. `l5-observability/1_end_to_end_tracing.ipynb`
+8. `l5-observability/2_observability_dashboard.ipynb`
 
+**Note:** Same number indicates they can be run in parallel. 
 ---
 
-## Third-Party Integration Options
+## Next Steps: 
+
+### Third-Party Integration Options
+
+**Pipeline: We have active work in progress to support integrations with NVIDIA, Datadog, Dynatrace and others.**  
 
 Each layer is pluggable. AWS services are the default, but every layer can be swapped:
 
-| Layer | Default (AWS) | Swap Target |
+| Layer | Default (AWS) | Supported Integrations |
 |-------|--------------|-------------|
-| L1 | Bedrock KB — OpenSearch Serverless | Future Integrations: Pinecone, Weaviate |
-| L2 | Amazon Bedrock, Fireworks AI | Future Integrations: OpenAI, Anthropic (direct) |
-| L3 | Strands (A2A agents) | Future Integrations: LangGraph, CrewAI, LlamaIndex |
-| L4 | Bedrock Guardrails, Custom Lambda interceptors | Future Integrations: Nemo Guardrails|
-| L5 | CloudWatch GenAI Observability | Future Integrations: Dynatrace, Langfuse, Datadog, New Relic |
+| L1 | Bedrock KB — OpenSearch Serverless | Upcoming |
+| L2 | Amazon Bedrock | Fireworks AI (notebooks will be available soon) |
+| L3 | Strands (A2A agents) | Upcoming |
+| L4 | Bedrock Guardrails, Custom Lambda interceptors | Upcoming|
+| L5 | CloudWatch GenAI Observability | Upcoming |
+
+> **NOTE:Partner Integration Content will be published soon.**
 
 ---
 
