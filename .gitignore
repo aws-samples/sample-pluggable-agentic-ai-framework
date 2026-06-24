@@ -1,0 +1,62 @@
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+python-sdk-test/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AWS
+.aws/
+.bedrock_agentcore.yaml
+
+# Docker
+.dockerignore
+
+# Agents build artifacts
+Dockerfile
+
+# Notebook outputs (optional — uncomment if you want clean notebooks)
+# *.ipynb  # use nbstripout instead
+
+# Secrets / credentials
+*.pem
+*.key
+.env
+.env.*
+
+# misc
+.DS_Store
+.claude
+
+# Workshop artifacts
+*.zip
+
+.ash
+.threatmodel
+holmes/
+copy_to_holmes*
+scan-report*
+.holmes/project.json
