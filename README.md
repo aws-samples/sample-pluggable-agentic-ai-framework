@@ -131,21 +131,23 @@ pluggable-agentic-ai-framework/
 
 ## Execution Order
 
-Each layer publishes resource IDs to SSM that the next layer reads. Run notebooks in this order:
+Each layer publishes resource IDs to SSM that the next layer reads. Run notebooks in the order below.
 
-1. `l1-data-knowledge/1_s3_knowledge_base_setup.ipynb`
-1. `l1-data-knowledge/2_dynamodb_tables.ipynb`
-1. `l2-inference/1_pluggable_inference_layer.ipynb`
-1. `l3-orchestration/1_pre-requisites.ipynb`
-2. `l3-orchestration/2_order_agent.ipynb`
-3. `l3-orchestration/3_refund_agent.ipynb`
-4. `l3-orchestration/4_orchestrator_agent.ipynb`
-5. `l3-orchestration/5_chatbot_ui.ipynb` 
-6. `l4-security/1_sensitive_data_masking.ipynb`
-7. `l5-observability/1_end_to_end_tracing.ipynb`
-8. `l5-observability/2_observability_dashboard.ipynb`
+> **Note:** Notebooks with the same order number can be run in parallel.
 
-**Note:** Same number indicates they can be run in parallel. 
+| Notebook | Order |
+|----------|-------|
+| `l1-data-knowledge/1_s3_knowledge_base_setup.ipynb` | 1 |
+| `l1-data-knowledge/2_dynamodb_tables.ipynb` | 1 |
+| `l2-inference/1_pluggable_inference_layer.ipynb` | 1 |
+| `l3-orchestration/1_pre-requisites.ipynb` | 1 |
+| `l3-orchestration/2_order_agent.ipynb` | 2 |
+| `l3-orchestration/3_refund_agent.ipynb` | 3 |
+| `l3-orchestration/4_orchestrator_agent.ipynb` | 4 |
+| `l3-orchestration/5_chatbot_ui.ipynb` | 5 |
+| `l4-security/1_sensitive_data_masking.ipynb` | 6 |
+| `l5-observability/1_end_to_end_tracing.ipynb` | 7 |
+| `l5-observability/2_observability_dashboard.ipynb` | 8 |
 ---
 
 ## Next Steps: 
