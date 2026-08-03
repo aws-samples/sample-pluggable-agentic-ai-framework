@@ -1,0 +1,12 @@
+# Framework packages pinned; transitive libs (httpx, uvicorn, fastapi, mcp,
+# pyyaml) intentionally unpinned so the resolver picks versions compatible with
+# strands-agents / bedrock-agentcore (their pinned combos conflict under `uv`).
+boto3==1.43.0
+bedrock-agentcore==1.14.0
+strands-agents[a2a,litellm]==1.43.0
+strands-agents-tools==0.2.0
+fastapi
+uvicorn
+pyyaml
+mcp
+httpx

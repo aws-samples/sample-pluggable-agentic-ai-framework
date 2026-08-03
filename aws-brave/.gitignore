@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Starter-toolkit artifacts (regenerated at deploy time by the notebook)
+.bedrock_agentcore.yaml
+Dockerfile
+.dockerignore
+
+# Duplicate copied into the build context at runtime by the notebook
+# (canonical lives at code/requirements_research_a2a.txt)
+code/research_agent/requirements_research_a2a.txt
