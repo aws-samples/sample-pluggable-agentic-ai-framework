@@ -426,7 +426,10 @@ def _websearch_diagram() -> str:
 
 
 def _observability_diagram() -> str:
-    """Agents emit OTel spans -> CloudWatch or Datadog; logs always -> CloudWatch."""
+    """Agents emit OTel spans -> CloudWatch or Datadog; logs always -> CloudWatch.
+
+    CloudZero mode is not drawn (it would need a third card): it is CloudWatch plus
+    the specialists' model-call spans to CloudZero, as the caption says."""
     rows = ["Orchestrator (Harness)", "Order Agent", "Refund Agent", "Research Agent"]
     agents = "".join(
         f'<rect x="38" y="{80 + i * 40}" width="160" height="32" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>'
@@ -468,8 +471,9 @@ def _observability_diagram() -> str:
     return _diagram_svg(
         body, "Agent observability: pluggable trace backend",
         "The orchestrator and the Order, Refund and Research agents emit OpenTelemetry spans. "
-        "Spans and traces go to the backend you pick, Amazon CloudWatch or Datadog. Logs always "
-        "go to Amazon CloudWatch Logs.",
+        "Spans and traces go to the backend you pick, Amazon CloudWatch or Datadog. With "
+        "CloudZero they stay on CloudWatch, and the Order, Refund and Research agents also send "
+        "each model call's span to CloudZero. Logs always go to Amazon CloudWatch Logs.",
     )
 
 
@@ -1919,7 +1923,7 @@ elif layer_id == "data":
 
 elif layer_id == "observability":
     # =====================================================================
-    # Observability layer - CloudWatch (AWS) vs Datadog.
+    # Observability layer - CloudWatch (AWS) vs Datadog vs CloudZero.
     # Logs ALWAYS route to CloudWatch; only spans/traces branch by provider.
     # The provider is chosen ONCE here and applies to all agents: the L3 agent
     # notebooks (2-5) read config/observability/provider when they deploy, and
@@ -1928,20 +1932,27 @@ elif layer_id == "observability":
     #   - Datadog is OTEL-direct (no sidecar/ddtrace) and captures THREE creds:
     #     api_key + app_key (SecureString) and site (String). Saving them also
     #     saves the provider id.
+    #   - CloudZero keeps CloudWatch for all traces and logs; the specialists also
+    #     send LiteLLM model-call spans to CloudZero. It captures api_key
+    #     (SecureString) and username (String) under config/cloudzero/. Saving
+    #     them also saves the provider id.
     # The provider id stored in SSM is the lowercase provider["value"]
-    # ("cloudwatch"/"datadog"), not the UI label.
+    # ("cloudwatch"/"datadog"/"cloudzero"), not the UI label.
     # =====================================================================
     _intro_with_diagram(
         "observability", "How agent observability works",
         "The agents emit OpenTelemetry spans for every model call and tool call. The "
-        "traces go to the backend you pick, and logs always go to CloudWatch.",
+        "traces go to the backend you pick, and logs always go to CloudWatch. With "
+        "CloudZero, traces stay on CloudWatch and the Order, Refund and Research agents "
+        "also send each model call's span (tokens and cost, no prompt text) to CloudZero; "
+        "the orchestrator is not sent.",
         _observability_diagram(), "Agent observability: pluggable trace backend",
     )
 
     # The saved choice (what the L3 notebooks will deploy with). Open the page on
     # it, so a participant who saved Datadog earlier sees Datadog selected.
     _provider_param = f"{CONFIG_PREFIX}/{layer_id}/provider"
-    _saved_obs = get_param(_provider_param)                      # "cloudwatch" | "datadog" | ""
+    _saved_obs = get_param(_provider_param)                      # "cloudwatch" | "datadog" | "cloudzero" | ""
     _by_value = {m.get("value", n): n for n, m in layer["providers"].items()}
     if layer_id not in st.session_state.selections and _saved_obs in _by_value:
         st.session_state.selections[layer_id] = _by_value[_saved_obs]
@@ -1992,7 +2003,8 @@ elif layer_id == "observability":
         _status = (f'<span class="badge-ok">✓ {html.escape(choice_name)} is your trace '
                    f'backend (the default)</span>')
     else:
-        _status = "Save your Datadog credentials below to switch to Datadog."
+        _status = (f"Save your {html.escape(choice_name)} credentials below to switch to "
+                   f"{html.escape(choice_name)}.")
     st.markdown(
         f'<div class="ssm-note">{_status}<br>One choice for all agents. Make it before Step 6 '
         f'of the Gateway Tools notebook, which confirms it, and before you deploy the agents. '
@@ -2000,10 +2012,11 @@ elif layer_id == "observability":
         unsafe_allow_html=True,
     )
 
-    # Datadog credentials. Saving them also makes Datadog the trace backend.
+    # Partner credentials (Datadog or CloudZero). Saving them also makes that
+    # provider the trace backend.
     if creds:
         portal = provider.get("portal")
-        dd_help = (f'Mint your keys in the Datadog portal, then paste them below: '
+        dd_help = (f'Get your credentials, then paste them below: '
                    f'<a href="{portal["url"]}" target="_blank" rel="noopener noreferrer">'
                    f'{portal["label"]}</a>.' if portal else "")
 
@@ -2019,12 +2032,12 @@ elif layer_id == "observability":
             put_param(_provider_param, provider_value, secure=False)
 
         keys_saved = _credential_form(
-            "observability_datadog", f"{choice_name} credentials",
+            f"observability_{provider_value}", f"{choice_name} credentials",
             [{"key": c["key"], "label": c["label"], "param": cred_param(layer_id, c),
               "secure": c.get("secure", True), "placeholder": c.get("placeholder", ""),
               "options": c.get("options")} for c in creds],
             help_html=dd_help,
-            note="Saving also makes Datadog your trace backend.",
+            note=f"Saving also makes {choice_name} your trace backend.",
             validate=_site_ok, after_save=_make_active,
         )
 
@@ -2033,7 +2046,7 @@ elif layer_id == "observability":
         # the saved "site" value, which is re-checked against the allowlist because
         # SSM can be written outside this UI.
         _dd_site = (get_param(cred_param(layer_id, {"key": "site"})) or "").strip()
-        if keys_saved and _dd_site in DATADOG_SITES:
+        if provider_value == "datadog" and keys_saved and _dd_site in DATADOG_SITES:
             _dd_app = (f"https://app.{_dd_site}"
                        if _dd_site in ("datadoghq.com", "datadoghq.eu", "ddog-gov.com")
                        else f"https://{_dd_site}")
@@ -2044,8 +2057,8 @@ elif layer_id == "observability":
                 f'{_dd_app}/dashboard/lists</a>.</div>',
                 unsafe_allow_html=True,
             )
-    # Paste snippet for Step 6 of 1_gateway_tools.ipynb. Datadog's stays locked
-    # until its keys are saved, like the other partner pages.
+    # Paste snippet for Step 6 of 1_gateway_tools.ipynb. Datadog's and CloudZero's
+    # stay locked until their credentials are saved, like the other partner pages.
     _obs_state = "open" if (not creds or keys_saved) else "locked"
     if _obs_state == "locked":
         _lock_hint()

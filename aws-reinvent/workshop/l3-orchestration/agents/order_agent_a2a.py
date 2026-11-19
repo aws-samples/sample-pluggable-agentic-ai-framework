@@ -238,5 +238,15 @@ except ImportError:
 
 install_datadog_observability(app)
 
+# CloudZero mode (CZ_OTEL_DIRECT=true): LiteLLM's model-call spans also go to
+# CloudZero, from a private TracerProvider; the runtime's global provider (ADOT)
+# keeps every other span. No-op otherwise; never raises (see agents/cz_otel.py).
+try:
+    from agents.cz_otel import install_cloudzero_observability
+except ImportError:
+    from cz_otel import install_cloudzero_observability
+
+install_cloudzero_observability()
+
 if __name__ == "__main__":
     uvicorn.run(app, host=host, port=port)

@@ -1,5 +1,6 @@
 """
-L3 — Observability provider branching (CloudWatch native | Datadog OTEL-direct).
+L3 — Observability provider branching (CloudWatch native | Datadog OTEL-direct |
+CloudZero).
 
 Mirrors the reInvent `helpers/*.py` pattern (see l1-data-knowledge/helpers):
 the provider branching lives here so the deploy notebooks (2_specialist_agents,
@@ -15,16 +16,23 @@ via the environment variables this helper emits. No ddtrace, no trace-agent
 sidecar, no AI Guard — that sidecar path is the separate aws-datadog track and
 must not be imported here.
 
-Logs ALWAYS stay on CloudWatch in both modes — only spans/traces branch.
+CloudZero mode keeps the managed ADOT on (all traces stay on CloudWatch) and
+additionally sends the specialists' LiteLLM model-call spans to CloudZero from a
+private TracerProvider in agents/cz_otel.py, configured by ``cloudzero_otel_env``.
+
+Logs ALWAYS stay on CloudWatch in every mode — only spans/traces branch.
 
 SSM schema (written by the L0 selector, read here):
-    {prefix}/config/observability/provider   # "cloudwatch" | "datadog" (String)
+    {prefix}/config/observability/provider   # "cloudwatch" | "datadog" | "cloudzero" (String)
     {prefix}/config/observability/api_key     # Datadog ingest key       (SecureString)
     {prefix}/config/observability/site        # Datadog site             (String)
+    {prefix}/config/cloudzero/api_key         # CloudZero ingest key     (SecureString)
+    {prefix}/config/cloudzero/username        # CloudZero username       (String)
 
 Public functions:
     get_observability_provider(ssm, prefix=...) -> str
     datadog_otel_env(ssm, service_name, prefix=...) -> dict[str, str]
+    cloudzero_otel_env(ssm, service_name, prefix=...) -> dict[str, str]
     mask_secret(value) -> str
 """
 from __future__ import annotations
@@ -149,4 +157,44 @@ def datadog_otel_env(ssm, service_name: str, prefix: str = SSM_PREFIX_DEFAULT) -
         # Harness-safe: the managed Harness runs no a2a-sdk, so this is inert
         # there (a passive marker it ignores, like DD_OTEL_DIRECT).
         "OTEL_INSTRUMENTATION_A2A_SDK_ENABLED": "false",
+    }
+
+
+def cloudzero_otel_env(ssm, service_name: str, prefix: str = SSM_PREFIX_DEFAULT) -> dict:
+    """Build the env vars that send the specialists' LiteLLM model-call spans to CloudZero.
+
+    Reads config/cloudzero/{api_key,username}. api_key is a SecureString, so
+    we decrypt it. Set on the specialist Runtimes via ``launch(env_vars=...)``;
+    agents/cz_otel.py reads them (gate ``CZ_OTEL_DIRECT``) and gives LiteLLM a
+    private TracerProvider. Only ``CZ_*`` names are used: the managed ADOT stays
+    on in CloudZero mode and would read any generic ``OTEL_*`` exporter/resource
+    var. Keep the key masked when printing.
+    """
+    api_key = ssm.get_parameter(
+        Name=f"{prefix}/config/cloudzero/api_key", WithDecryption=True
+    )["Parameter"]["Value"].strip()
+    username = ssm.get_parameter(
+        Name=f"{prefix}/config/cloudzero/username"
+    )["Parameter"]["Value"].strip()
+    # Same checks as agents/cz_otel.py, so the attendee sees the problem here rather
+    # than an untraced agent. The message never includes the key.
+    if not api_key or not (api_key.isascii() and api_key.isprintable()) \
+            or " " in api_key or "," in api_key:
+        raise ValueError(
+            f"CloudZero API key in {prefix}/config/cloudzero/api_key is empty or contains "
+            "whitespace, a control character, a non-ASCII character or ','. "
+            "Re-enter it in Partner Selection."
+        )
+    if not username or not username.isprintable() or "," in username or "%" in username:
+        raise ValueError(
+            f"CloudZero username in {prefix}/config/cloudzero/username is empty or contains "
+            "a control character, ',' or '%'. Re-enter it in Partner Selection."
+        )
+    return {
+        "CZ_OTEL_DIRECT": "true",
+        "CZ_OTEL_ENDPOINT": "https://telemetry.cloudzero.com/v2/telemetry/litellm/v1/traces",
+        "CZ_API_KEY": api_key,
+        # Resource attribute attendee_id: the per-attendee tag.
+        "CZ_ATTENDEE_ID": username,
+        "CZ_SERVICE_NAME": service_name,
     }
