@@ -205,11 +205,10 @@ LAYERS = [
                                "detail. Logs stay in CloudWatch."
                                + _doc("https://docs.datadoghq.com/llm_observability/instrument/otel_instrumentation/",
                                       "Datadog OpenTelemetry instrumentation documentation"),
-                # Portal link shown in the UI so participants can mint keys.
-                # Workshop sample credentials site (NOT the real Datadog console).
+                # Link shown in the UI so participants can create their keys.
                 "portal": {
-                    "url": "https://d30e85iz16sg8a.cloudfront.net/",
-                    "label": "Create Datadog API & application keys",
+                    "url": "https://docs.datadoghq.com/account_management/api-app-keys/",
+                    "label": "How to create Datadog API and application keys",
                 },
                 # Datadog needs THREE credentials. "credentials" (a list) is the
                 # multi-field form of the single-field "credential" shape the
