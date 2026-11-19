@@ -10,7 +10,7 @@ AGENTS table and passes one entry to each function here:
         "entrypoint":       "agents/order_agent_a2a.py",
         "requirements":     "agents/requirements_order_a2a.txt",
         "role_param":       "order_agent_runtime_role_arn",     # SSM key of the runtime role
-        "service_name":     "anycompany-order-agent",           # Datadog service name
+        "service_name":     "anycompany-order-agent",           # Datadog / CloudZero service name
         "record_name":      "order_agent_a2a_record",           # AgentCore Registry record
         "display_name":     "Order Agent (A2A)",
         "description":      "...",
@@ -40,7 +40,7 @@ import requests
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 
-from .observability import datadog_otel_env, mask_secret
+from .observability import cloudzero_otel_env, datadog_otel_env, mask_secret
 
 SSM_PREFIX = "/anycompany/agentcore"
 
@@ -72,8 +72,11 @@ def deploy_agent(agent: dict, region: str, obs_provider: str, *, ssm_prefix: str
     The runtime role is pre-provisioned by CloudFormation and read from SSM.
     With obs_provider == "datadog", managed ADOT is turned off and the
     OTEL-direct environment variables are passed, so the agent's own exporter
-    (agents/dd_otel.py) sends spans straight to Datadog. Logs always stay in
-    CloudWatch. Returns the runtime ARN; raises if the deployment fails.
+    (agents/dd_otel.py) sends spans straight to Datadog. With obs_provider ==
+    "cloudzero", managed ADOT stays on (all traces stay in CloudWatch) and the
+    CZ_* environment variables are passed, so agents/cz_otel.py also sends
+    LiteLLM's model-call spans to CloudZero. Logs always stay in CloudWatch.
+    Returns the runtime ARN; raises if the deployment fails.
     """
     from bedrock_agentcore_starter_toolkit import Runtime
 
@@ -111,6 +114,16 @@ def deploy_agent(agent: dict, region: str, obs_provider: str, *, ssm_prefix: str
         key = otel_env["OTEL_EXPORTER_OTLP_TRACES_HEADERS"].split("dd-api-key=", 1)[-1]
         print(f"  Datadog OTEL-direct: service={otel_env['OTEL_SERVICE_NAME']}  dd-api-key={mask_secret(key)}")
         launch_result = runtime.launch(auto_update_on_conflict=True, env_vars=otel_env)
+    elif obs_provider == "cloudzero":
+        # ADOT stays on (no disable_otel, no DISABLE_ADOT_OBSERVABILITY), so all
+        # traces and logs stay in CloudWatch. agents/cz_otel.py reads these CZ_*
+        # variables and sends LiteLLM's model-call spans (tokens and cost, no
+        # message content) to CloudZero from a private TracerProvider. The key is
+        # never printed.
+        cz_env = cloudzero_otel_env(ssm, agent["service_name"], ssm_prefix)
+        print(f"  CloudZero model-call spans: service={cz_env['CZ_SERVICE_NAME']}  "
+              f"attendee_id={cz_env['CZ_ATTENDEE_ID']}  endpoint={cz_env['CZ_OTEL_ENDPOINT']}")
+        launch_result = runtime.launch(auto_update_on_conflict=True, env_vars=cz_env)
     else:
         launch_result = runtime.launch(auto_update_on_conflict=True)
 
