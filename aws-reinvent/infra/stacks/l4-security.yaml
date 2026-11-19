@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  L4 Security — execution role for the anycompany-pii-interceptor Lambda and its SSM handoff.
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in the role description so it is traceable
+      to the parent (a nested stack's own name is auto-generated).
+
+Resources:
+
+  # Execution role for the L4 PII interceptor Lambda (1_sensitive_data_masking.ipynb Step 4).
+  # The Lambda applies a Bedrock Guardrail to Gateway tool responses to anonymize PII.
+  # ApplyGuardrail is scoped to guardrail/* because the guardrail is created in the notebook
+  # (Step 2), so its id is not known at stack-deploy time. Tighten to the specific guardrail
+  # ARN once the guardrail itself moves to CloudFormation.
+  InterceptorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AnyCompanyPIIInterceptorLambdaRole
+      Description: !Sub "Execution role for the anycompany-pii-interceptor Lambda (L4 security). Part of ${ParentStackName}."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PIIInterceptorPerms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # "anycompany-pii-interceptor" must match INTERCEPTOR_LAMBDA_NAME in the
+              # l4-security notebook (Step 4) and the invoke grant in l3-orchestration.yaml.
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/anycompany-pii-interceptor"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/anycompany-pii-interceptor:*"
+              - Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+
+  SsmInterceptorRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/interceptor_role_arn
+      Type: String
+      Value: !GetAtt InterceptorLambdaRole.Arn
+
+Outputs:
+  InterceptorLambdaRoleArn:
+    Description: ARN of the PII interceptor Lambda execution role.
+    Value: !GetAtt InterceptorLambdaRole.Arn

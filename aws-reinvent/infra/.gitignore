@@ -1,0 +1,5 @@
+# Generated artifact — rebuild locally via scripts/build-workshop-zip.sh
+assets/workshop.zip
+
+# OS cruft
+.DS_Store

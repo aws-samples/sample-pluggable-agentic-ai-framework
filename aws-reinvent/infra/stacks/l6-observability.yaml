@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  L6 Observability — X-Ray Transaction Search for AgentCore traces.
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in physical resource names so they stay
+      the same as in the single-stack template (a nested stack's own name is auto-generated).
+
+  EnableTransactionSearch:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: >
+      Enable the AWS::XRay::TransactionSearchConfig CloudFormation resource. The X-Ray
+      Transaction Search feature is a per-account singleton and the CFN resource provider
+      errors with "AlreadyExists" if it is already enabled (e.g. by a previous stack with
+      DeletionPolicy: Retain, or by the console). Set to 'true' only for first-time deploys
+      into a brand-new account; leave as 'false' when the setting is already active.
+
+Conditions:
+  CreateTransactionSearch: !Equals [!Ref EnableTransactionSearch, 'true']
+
+Resources:
+
+
+  # ---------------------------------------------------------------------------
+  # X-Ray Transaction Search (AgentCore Observability)
+  # ---------------------------------------------------------------------------
+  TransactionSearchPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub 'aapcf-xray-spans-${ParentStackName}'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "TransactionSearchXRayAccess",
+              "Effect": "Allow",
+              "Principal": { "Service": "xray.amazonaws.com" },
+              "Action": "logs:PutLogEvents",
+              "Resource": [
+                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*",
+                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
+              ],
+              "Condition": {
+                "ArnLike": { "aws:SourceArn": "arn:aws:xray:${AWS::Region}:${AWS::AccountId}:*" },
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" }
+              }
+            }
+          ]
+        }
+
+
+  TransactionSearchConfig:
+    Type: AWS::XRay::TransactionSearchConfig
+    Condition: CreateTransactionSearch
+    DependsOn: TransactionSearchPolicy
+    # X-Ray Transaction Search is an account-level singleton. Once enabled it
+    # stays enabled, and the resource provider:
+    #   - fails CREATE with "AlreadyExists" if the setting is already active
+    #     (gate the resource behind the EnableTransactionSearch parameter)
+    #   - leaves the service stuck in PENDING on DELETE and blocks the whole
+    #     stack delete (Retain on delete, CFN just drops the stack reference)
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      IndexingPercentage: 100

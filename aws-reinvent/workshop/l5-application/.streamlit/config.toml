@@ -1,0 +1,17 @@
+# Listen on loopback only. Streamlit's default binds every interface, which would
+# expose the chatbot (and its login form) to the local network. SageMaker Studio's
+# Jupyter proxy (/jupyterlab/default/proxy/8502/) connects via localhost, so it works.
+[server]
+address = "127.0.0.1"
+
+# Light theme with a navy accent for the AnyCompany support chatbot.
+[theme]
+base = "light"
+primaryColor = "#1e3a8a"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6fb"
+textColor = "#0f172a"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Agentic AI Workshop with Swappable Layers.
+  Parent stack: one nested stack per layer (platform/Studio, L1 data, L3 orchestration,
+  L4 security, L5 decision models, L6 observability). Child templates live in the assets bucket
+  under <AssetsBucketPrefix>stacks/ (uploaded by scripts/deploy-stack.sh).
+
+Parameters:
+  ParticipantRoleArn:
+    Type: String
+    Default: unused
+    Description: ARN of the Workshop Studio participant IAM role. Unused outside Workshop Studio.
+
+  AssetsBucketName:
+    Type: String
+    Description: S3 bucket name holding workshop.zip (Workshop Studio injects this; supply your own when self-deploying).
+
+  AssetsBucketPrefix:
+    Type: String
+    Description: S3 prefix for workshop assets, ending in '/' (e.g. 'latest/'). Workshop Studio injects this with the trailing slash; include it when self-deploying.
+
+  UserProfileName:
+    Type: String
+    Description: The user profile name for the SageMaker workshop
+    Default: 'workshopuser'
+
+  DomainName:
+    Type: String
+    Description: The domain name of the SageMaker Studio instance
+    Default: 'aapcf-workshop'
+
+  SpaceName:
+    Type: String
+    Description: The space name of the SageMaker Studio JupyterLab instance
+    Default: 'aapcf-workshop-space'
+
+  EnableTransactionSearch:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: >
+      Pass through to L6 Observability. X-Ray Transaction Search is a per-account
+      singleton; set to 'true' only on first-time deploy into a brand-new account.
+      Keep 'false' for redeploys and for accounts where the setting is already active
+      (e.g. previously retained by DeletionPolicy: Retain or set in the X-Ray console).
+
+  # --- L5 Strands Decider (pre-provisioned SageMaker endpoint) ---------------
+  DeployDecider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: >
+      Pre-provision the Strands Decider SageMaker endpoint used by the L5 decision-model lab.
+      The endpoint bills per instance-hour from stack creation. Set to 'false' to skip it.
+  DeciderModel:
+    Type: String
+    Default: StrandsAgents/strands-decider-2B-qwen3.5-v1-2610
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$'
+    Description: Hugging Face Hub id of the Strands Decider model (org/name).
+  DeciderModelRevision:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+    Description: Model revision on the Hugging Face Hub. Use a release date tag (YYMMDD) to pin it.
+  DeciderRepoCommit:
+    Type: String
+    Default: b81d443c07438dc5ed51d0e85f9db184ad65d809
+    AllowedPattern: '^[0-9a-f]{40}$'
+    Description: strands-labs/strands-decider commit whose Dockerfile and fetch script are used.
+  DeciderGpuInstanceTypes:
+    Type: String
+    Default: 'ml.g6.xlarge,ml.g5.xlarge,ml.g6e.xlarge'
+    AllowedPattern: '^(ml\.[a-z0-9-]+\.[a-z0-9]+(,ml\.[a-z0-9-]+\.[a-z0-9]+){0,4})?$'
+    Description: >
+      GPU instance pools, highest priority first (up to 5, comma-separated). Tried before the CPU
+      pools. Use NVIDIA types with local NVMe storage (ml.g5, ml.g6, ml.g6e). Empty skips GPU.
+  DeciderCpuInstanceTypes:
+    Type: String
+    Default: 'ml.m5.2xlarge,ml.m5.4xlarge'
+    AllowedPattern: '^ml\.[a-z0-9-]+\.[a-z0-9]+(,ml\.[a-z0-9-]+\.[a-z0-9]+){0,4}$'
+    Description: >
+      CPU fallback instance pools, highest priority first (up to 5). Used when no GPU pool has capacity
+      or quota. Use x86 types without local storage and more than 9 GB of memory (ml.m5, ml.c6i, ml.r5).
+
+Conditions:
+  CreateDecider: !Equals [!Ref DeployDecider, 'true']
+
+Resources:
+  # Each layer is its own nested stack. They share no resources, so they deploy in
+  # parallel; physical names are unchanged (children get ParentStackName).
+
+  PlatformStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/platform-studio.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        AssetsBucketName: !Ref AssetsBucketName
+        AssetsBucketPrefix: !Ref AssetsBucketPrefix
+        UserProfileName: !Ref UserProfileName
+        DomainName: !Ref DomainName
+        SpaceName: !Ref SpaceName
+
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/l1-data.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        AssetsBucketName: !Ref AssetsBucketName
+        AssetsBucketPrefix: !Ref AssetsBucketPrefix
+
+  OrchestrationStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/l3-orchestration.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+
+  # Research Agent web search: its runtime role and the pre-built Brave MCP server.
+  WebSearchStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/l3-websearch.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+
+  DecisionStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: CreateDecider
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/l5-decision.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        DeciderModel: !Ref DeciderModel
+        DeciderModelRevision: !Ref DeciderModelRevision
+        DeciderRepoCommit: !Ref DeciderRepoCommit
+        DeciderGpuInstanceTypes: !Ref DeciderGpuInstanceTypes
+        DeciderCpuInstanceTypes: !Ref DeciderCpuInstanceTypes
+
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/l4-security.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${AssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${AssetsBucketPrefix}stacks/l6-observability.yaml"
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        EnableTransactionSearch: !Ref EnableTransactionSearch
+
+Outputs:
+  SageMakerDomainId:
+    Description: SageMaker Studio Domain ID
+    Value: !GetAtt PlatformStack.Outputs.SageMakerDomainId
+
+  SageMakerExecutionRoleArn:
+    Description: ARN of the SageMaker Execution Role
+    Value: !GetAtt PlatformStack.Outputs.SageMakerExecutionRoleArn
+
+  StudioConsoleUrl:
+    Description: Direct link to SageMaker Studio in the console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/studio"
+
+  JupyterLabAppStatus:
+    Description: Status of the JupyterLab app at stack creation time
+    Value: !GetAtt PlatformStack.Outputs.JupyterLabAppStatus
+
+  CustomerOrdersTableName:
+    Description: DynamoDB table pre-loaded with sample customer orders
+    Value: !GetAtt DataStack.Outputs.CustomerOrdersTableName
+
+  CustomerOrdersTableArn:
+    Description: ARN of the DynamoDB table (useful for IAM policy writing)
+    Value: !GetAtt DataStack.Outputs.CustomerOrdersTableArn
+
+  SampleDataLoaderFunctionName:
+    Description: Lambda custom resource that loads sample orders at stack create time
+    Value: !GetAtt DataStack.Outputs.SampleDataLoaderFunctionName
+
+  AgentGatewayUrl:
+    Description: MCP URL of the Cognito-JWT agent gateway
+    Value: !GetAtt OrchestrationStack.Outputs.AgentGatewayUrl
+
+  AgentGatewayArn:
+    Description: ARN of the Cognito-JWT agent gateway
+    Value: !GetAtt OrchestrationStack.Outputs.AgentGatewayArn
+
+  HarnessGatewayArn:
+    Description: ARN of the IAM-auth Harness gateway
+    Value: !GetAtt OrchestrationStack.Outputs.HarnessGatewayArn
+
+  InterceptorLambdaRoleArn:
+    Description: ARN of the L4 PII interceptor Lambda execution role
+    Value: !GetAtt SecurityStack.Outputs.InterceptorLambdaRoleArn
+
+  CognitoUserPoolId:
+    Description: AnyCompany agent Cognito user pool ID
+    Value: !GetAtt OrchestrationStack.Outputs.CognitoUserPoolId
+
+  CognitoClientId:
+    Description: AnyCompany chatbot Cognito app client ID
+    Value: !GetAtt OrchestrationStack.Outputs.CognitoClientId
+
+  GatewayExecutionRoleArn:
+    Description: ARN of the AgentCore gateway execution role
+    Value: !GetAtt OrchestrationStack.Outputs.GatewayExecutionRoleArn
+
+  RegistryId:
+    Description: AnyCompany AgentCore Registry ID
+    Value: !GetAtt OrchestrationStack.Outputs.RegistryId
+
+  RegistryArn:
+    Description: AnyCompany AgentCore Registry ARN
+    Value: !GetAtt OrchestrationStack.Outputs.RegistryArn
+
+  KBSourceBucketName:
+    Description: S3 bucket where the L1 notebook uploads return-policy documents
+    Value: !GetAtt DataStack.Outputs.KBSourceBucketName
+
+  KBExecutionRoleArn:
+    Description: IAM role Bedrock assumes to read S3, invoke Titan, and call OpenSearch
+    Value: !GetAtt DataStack.Outputs.KBExecutionRoleArn
+
+  DeciderStateMachineArn:
+    Condition: CreateDecider
+    Description: Step Functions state machine that provisions the Strands Decider endpoint
+    Value: !GetAtt DecisionStack.Outputs.DeciderStateMachineArn
+  DeciderModelBucketName:
+    Condition: CreateDecider
+    Description: Private S3 bucket holding the Strands Decider model weights
+    Value: !GetAtt DecisionStack.Outputs.DeciderModelBucketName
+  DeciderImageRepositoryUri:
+    Condition: CreateDecider
+    Description: ECR repository holding the Strands Decider cuda and cpu images
+    Value: !GetAtt DecisionStack.Outputs.DeciderImageRepositoryUri

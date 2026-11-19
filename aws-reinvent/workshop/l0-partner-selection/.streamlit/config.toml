@@ -1,0 +1,18 @@
+# Theme for the Partner Selection UI.
+# Light theme with an indigo accent (also keeps Streamlit from rendering its
+# default red on secondary buttons, focus rings, selections, etc.).
+[theme]
+base = "light"
+primaryColor = "#6d5cff"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f5f8"
+textColor = "#0f172a"
+
+[client]
+toolbarMode = "minimal"
+
+# Listen on loopback only. Streamlit's default binds every interface, which would
+# expose this UI (and its API-key fields) to the local network. SageMaker Studio's
+# Jupyter proxy (/jupyterlab/default/proxy/8501/) connects via localhost, so it works.
+[server]
+address = "127.0.0.1"

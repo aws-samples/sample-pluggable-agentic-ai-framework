@@ -1,0 +1,1245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Platform — SageMaker AI Studio domain, user profile and JupyterLab space, execution role, and the lifecycle config that syncs workshop content.
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in physical resource names so they stay
+      the same as in the single-stack template (a nested stack's own name is auto-generated).
+
+
+  AssetsBucketName:
+    Type: String
+    Description: S3 bucket name holding workshop.zip (Workshop Studio injects this; supply your own when self-deploying).
+
+
+  AssetsBucketPrefix:
+    Type: String
+    Description: S3 prefix for workshop.zip (Workshop Studio injects this; supply your own when self-deploying).
+
+
+  UserProfileName:
+    Type: String
+    Description: The user profile name for the SageMaker workshop
+
+
+  DomainName:
+    Type: String
+    Description: The domain name of the SageMaker Studio instance
+
+
+  SpaceName:
+    Type: String
+    Description: The space name of the SageMaker Studio JupyterLab instance
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      jupyter: "arn:aws:sagemaker:us-east-1:885854791233:image/sagemaker-distribution-cpu"
+      instance: "ml.m5.4xlarge"
+    us-west-2:
+      jupyter: "arn:aws:sagemaker:us-west-2:542918446943:image/sagemaker-distribution-cpu"
+      instance: "ml.m5.4xlarge"
+
+Resources:
+
+
+  # ---------------------------------------------------------------------------
+  # Lambda helper: discover default VPC and subnets
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ec2-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: '*'
+
+
+  DefaultVpcLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ParentStackName}-GetDefaultVpc'
+      Code:
+        ZipFile: |
+          import boto3
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          def _send(event, context, status, data=None, physical=None):
+              import json, urllib.request
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              if 'RequestType' in event and event['RequestType'] == 'Create':
+                  vpc_id = get_default_vpc_id()
+                  subnets = get_subnets_for_vpc(vpc_id)
+                  _send(event, context, SUCCESS, {'VpcId': vpc_id, 'Subnets': subnets}, '')
+              else:
+                  _send(event, context, SUCCESS, {}, '')
+
+          def get_default_vpc_id():
+              vpcs = ec2.describe_vpcs(Filters=[{'Name': 'is-default', 'Values': ['true']}])
+              return vpcs['Vpcs'][0]['VpcId']
+
+          def get_subnets_for_vpc(vpcId):
+              response = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpcId]}])
+              return [subnet['SubnetId'] for subnet in response['Subnets']]
+      Description: Return default VPC ID and Subnets
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 5
+
+
+  DefaultVpcFinder:
+    Type: Custom::ResourceForFindingDefaultVpc
+    Properties:
+      ServiceToken: !GetAtt DefaultVpcLambda.Arn
+      ServiceTimeout: 5
+
+
+  # ---------------------------------------------------------------------------
+  # IAM: Workshop Execution Policy (SageMaker Execution Role)
+  # ---------------------------------------------------------------------------
+  # Agent runtime services (AgentCore, Agent Registry).
+  # IAM managed policies are limited to 6,144 characters, so the notebook
+  # role's permissions are split across four policies.
+  WorkshopExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # AgentCore resources the labs create, matched by the names the notebooks and the
+          # starter toolkit give them (agent runtimes, the orchestrator Harness, memory,
+          # gateways, evaluators, configuration bundle, API-key providers, workload identities).
+          - Sid: AgentCoreWorkshopResources
+            Effect: Allow
+            Action:
+              - "bedrock-agentcore:CreateAgentRuntimeEndpoint"
+              - "bedrock-agentcore:DeleteAgentRuntime"
+              - "bedrock-agentcore:DeleteAgentRuntimeEndpoint"
+              - "bedrock-agentcore:GetAgentRuntime"
+              - "bedrock-agentcore:GetAgentRuntimeEndpoint"
+              - "bedrock-agentcore:UpdateAgentRuntime"
+              - "bedrock-agentcore:InvokeAgentRuntime"
+              - "bedrock-agentcore:InvokeAgentRuntimeForUser"
+              - "bedrock-agentcore:GetAgentCard"
+              - "bedrock-agentcore:StopRuntimeSession"
+              - "bedrock-agentcore:GetHarness"
+              - "bedrock-agentcore:UpdateHarness"
+              - "bedrock-agentcore:DeleteHarness"
+              - "bedrock-agentcore:InvokeHarness"
+              - "bedrock-agentcore:GetMemory"
+              - "bedrock-agentcore:UpdateMemory"
+              - "bedrock-agentcore:DeleteMemory"
+              - "bedrock-agentcore:UpdateMemoryRecordExpirySpecification"
+              - "bedrock-agentcore:GetGateway"
+              - "bedrock-agentcore:UpdateGateway"
+              - "bedrock-agentcore:CreateGatewayTarget"
+              - "bedrock-agentcore:GetGatewayTarget"
+              - "bedrock-agentcore:UpdateGatewayTarget"
+              - "bedrock-agentcore:DeleteGatewayTarget"
+              - "bedrock-agentcore:ListGatewayTargets"
+              - "bedrock-agentcore:SynchronizeGatewayTargets"
+              - "bedrock-agentcore:GetEvaluator"
+              - "bedrock-agentcore:DeleteEvaluator"
+              - "bedrock-agentcore:GetOnlineEvaluationConfig"
+              - "bedrock-agentcore:DeleteOnlineEvaluationConfig"
+              - "bedrock-agentcore:GetConfigurationBundle"
+              - "bedrock-agentcore:UpdateConfigurationBundle"
+              - "bedrock-agentcore:DeleteConfigurationBundle"
+              - "bedrock-agentcore:CreateApiKeyCredentialProvider"
+              - "bedrock-agentcore:GetApiKeyCredentialProvider"
+              - "bedrock-agentcore:UpdateApiKeyCredentialProvider"
+              - "bedrock-agentcore:DeleteApiKeyCredentialProvider"
+              - "bedrock-agentcore:GetTokenVault"
+              - "bedrock-agentcore:CreateTokenVault"
+              - "bedrock-agentcore:GetResourceApiKey"
+              - "bedrock-agentcore:CreateWorkloadIdentity"
+              - "bedrock-agentcore:GetWorkloadIdentity"
+              - "bedrock-agentcore:DeleteWorkloadIdentity"
+              - "bedrock-agentcore:GetWorkloadAccessToken"
+              - "bedrock-agentcore:GetResourceOauth2Token"
+              - "bedrock-agentcore:GetRecommendation"
+              - "bedrock-agentcore:DeleteRecommendation"
+              - "bedrock-agentcore:GetBatchEvaluation"
+              - "bedrock-agentcore:AllowVendedLogDeliveryForResource"
+              - "bedrock-agentcore:TagResource"
+            Resource:
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/order_agent_a2a-*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/refund_agent_a2a-*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/research_agent_a2a-*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/brave_mcp_server-*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/harness_anycompany_*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:harness/anycompany_*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/anycompany_*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/anycompany-*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/AnyCompany*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/AnyCompany*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/anycompany_*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/apikeycredentialprovider/anycompany-*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:recommendation/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:batch-evaluate/*"
+          # These actions are authorized against a wildcard ARN: create calls check
+          # them on the new resource before its ID exists, and CloudWatch Logs checks
+          # vended log delivery for memory against memory/*.
+          - Sid: AgentCoreCreateTimeActions
+            Effect: Allow
+            Action:
+              - "bedrock-agentcore:CreateAgentRuntimeEndpoint"
+              - "bedrock-agentcore:TagResource"
+              - "bedrock-agentcore:UpdateMemoryRecordExpirySpecification"
+              - "bedrock-agentcore:AllowVendedLogDeliveryForResource"
+            Resource:
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*/runtime-endpoint/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:harness/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/apikeycredentialprovider/*"
+          # Listing bundle versions is authorized against a wildcard bundle ARN,
+          # even when the request names one bundle. Read-only.
+          - Sid: AgentCoreListBundleVersions
+            Effect: Allow
+            Action:
+              - "bedrock-agentcore:ListConfigurationBundleVersions"
+            Resource:
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/*"
+          # L7 on-demand evaluation runs workshop and built-in evaluators
+          # (Builtin.*), and reads each evaluator to find its level.
+          - Sid: AgentCoreEvaluate
+            Effect: Allow
+            Action:
+              - "bedrock-agentcore:Evaluate"
+              - "bedrock-agentcore:GetEvaluator"
+            Resource:
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/*"
+              - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:evaluator/*"
+          # These create and list actions do not support resource-level permissions.
+          - Sid: AgentCoreCreateAndList
+            Effect: Allow
+            Action:
+              - "bedrock-agentcore:CreateAgentRuntime"
+              - "bedrock-agentcore:CreateHarness"
+              - "bedrock-agentcore:CreateGateway"
+              - "bedrock-agentcore:CreateMemory"
+              - "bedrock-agentcore:CreateEvaluator"
+              - "bedrock-agentcore:CreateOnlineEvaluationConfig"
+              - "bedrock-agentcore:CreateConfigurationBundle"
+              - "bedrock-agentcore:StartBatchEvaluation"
+              - "bedrock-agentcore:StartRecommendation"
+              - "bedrock-agentcore:ListAgentRuntimes"
+              - "bedrock-agentcore:ListHarnesses"
+              - "bedrock-agentcore:ListMemories"
+              - "bedrock-agentcore:ListGateways"
+              - "bedrock-agentcore:ListEvaluators"
+              - "bedrock-agentcore:ListOnlineEvaluationConfigs"
+              - "bedrock-agentcore:ListConfigurationBundles"
+            Resource: "*"
+          # L3 registers and removes the specialist agents in the stack-created registry.
+          - Sid: AgentRegistryRecords
+            Effect: Allow
+            Action:
+              - "agent-registry:CreateRegistryRecord"
+              - "agent-registry:GetRegistryRecord"
+              - "agent-registry:ListRegistryRecords"
+              - "agent-registry:SubmitRegistryRecordForApproval"
+              - "agent-registry:DeleteRegistryRecord"
+              - "agent-registry:TagResource"
+            Resource:
+              - !Sub "arn:aws:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/*"
+
+  # Models, data and build services (SageMaker, Bedrock, OpenSearch Serverless, EC2, DynamoDB, ECR, CodeBuild, CloudFormation).
+  WorkshopExecutionPolicyModels:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # SageMaker Studio and L5 read their own domain, space and endpoints. Read-only.
+          - Sid: SageMakerRead
+            Effect: Allow
+            Action:
+              - "sagemaker:Describe*"
+              - "sagemaker:List*"
+              - "sagemaker:Search"
+              - "sagemaker:GetSagemakerServicecatalogPortfolioStatus"
+            Resource: "*"
+          # L5 calls only the stack-created decider endpoints.
+          - Sid: SageMakerInvokeDecider
+            Effect: Allow
+            Action:
+              - "sagemaker:InvokeEndpoint"
+            Resource:
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ParentStackName}-decider-*"
+          # Open Studio and start or stop the workshop JupyterLab space. Limited to
+          # this workshop's user profile and space. The domain ID is a wildcard
+          # because the domain uses this role, so referencing it would be circular.
+          - Sid: SageMakerStudioWorkshopSpace
+            Effect: Allow
+            Action:
+              - "sagemaker:CreatePresignedDomainUrl"
+              - "sagemaker:CreateApp"
+              - "sagemaker:DeleteApp"
+              - "sagemaker:UpdateSpace"
+            Resource:
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/*/${UserProfileName}"
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:space/*/${SpaceName}"
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:app/*/${UserProfileName}/*"
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:app/*/${SpaceName}/*"
+          # SageMaker tags apps on create, so tag-on-create is required.
+          - Sid: SageMakerStudioTagOnCreate
+            Effect: Allow
+            Action:
+              - "sagemaker:AddTags"
+            Resource:
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:app/*/${UserProfileName}/*"
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:app/*/${SpaceName}/*"
+            Condition:
+              "Null":
+                sagemaker:TaggingAction: "false"
+          # Model invocation (L1-L7). Cross-Region inference profiles route to foundation models in other Regions.
+          - Sid: BedrockInvokeModels
+            Effect: Allow
+            Action:
+              - "bedrock:InvokeModel"
+              - "bedrock:InvokeModelWithResponseStream"
+            Resource:
+              - "arn:aws:bedrock:*::foundation-model/*"
+              - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+          # L4 guardrail and L1 knowledge base, limited to guardrails and knowledge bases in this account and Region.
+          - Sid: BedrockGuardrailsAndKnowledgeBases
+            Effect: Allow
+            Action:
+              - "bedrock:ApplyGuardrail"
+              - "bedrock:GetGuardrail"
+              - "bedrock:CreateGuardrailVersion"
+              - "bedrock:DeleteGuardrail"
+              - "bedrock:GetKnowledgeBase"
+              - "bedrock:DeleteKnowledgeBase"
+              - "bedrock:CreateDataSource"
+              - "bedrock:GetDataSource"
+              - "bedrock:DeleteDataSource"
+              - "bedrock:ListDataSources"
+              - "bedrock:StartIngestionJob"
+              - "bedrock:GetIngestionJob"
+              - "bedrock:Retrieve"
+              - "bedrock:TagResource"
+            Resource:
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+          # These create and list actions do not support resource-level permissions.
+          - Sid: BedrockCreateAndList
+            Effect: Allow
+            Action:
+              - "bedrock:CreateGuardrail"
+              - "bedrock:CreateKnowledgeBase"
+              - "bedrock:ListGuardrails"
+              - "bedrock:ListKnowledgeBases"
+            Resource: "*"
+          # L1 vector collection: index creation (APIAccessAll), tagging and cleanup.
+          # Amazon OpenSearch Service domains (es:*) are not used.
+          - Sid: OpenSearchServerlessCollection
+            Effect: Allow
+            Action:
+              - "aoss:APIAccessAll"
+              - "aoss:DeleteCollection"
+              - "aoss:TagResource"
+            Resource:
+              - !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+          # Security and data access policies have no resource ARN. OpenSearch
+          # Serverless authorizes each rule in the policy separately: collection
+          # rules by aoss:collection and index rules by aoss:index. These two
+          # statements limit both to the workshop collection.
+          - Sid: OpenSearchServerlessPoliciesCollection
+            Effect: Allow
+            Action:
+              - "aoss:CreateSecurityPolicy"
+              - "aoss:UpdateSecurityPolicy"
+              - "aoss:DeleteSecurityPolicy"
+              - "aoss:CreateAccessPolicy"
+              - "aoss:UpdateAccessPolicy"
+              - "aoss:DeleteAccessPolicy"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aoss:collection: "composable-agents-collection"
+          - Sid: OpenSearchServerlessPoliciesIndex
+            Effect: Allow
+            Action:
+              - "aoss:CreateAccessPolicy"
+              - "aoss:UpdateAccessPolicy"
+              - "aoss:DeleteAccessPolicy"
+            Resource: "*"
+            Condition:
+              StringLike:
+                aoss:index:
+                  - "composable-agents-collection/*"
+                  - "index/composable-agents-collection/*"
+          # These actions do not support resource-level permissions.
+          - Sid: OpenSearchServerlessCreateAndRead
+            Effect: Allow
+            Action:
+              - "aoss:CreateCollection"
+              - "aoss:BatchGetCollection"
+              - "aoss:GetSecurityPolicy"
+              - "aoss:GetAccessPolicy"
+              - "aoss:CreateVpcEndpoint"
+              - "aoss:DeleteVpcEndpoint"
+              - "aoss:ListVpcEndpoints"
+              - "aoss:BatchGetVpcEndpoint"
+            Resource: "*"
+          # L1 finds the default VPC for the private OpenSearch Serverless endpoint. Read-only.
+          - Sid: EC2DescribeNetwork
+            Effect: Allow
+            Action:
+              - "ec2:DescribeVpcs"
+              - "ec2:DescribeSubnets"
+              - "ec2:DescribeSecurityGroups"
+              - "ec2:DescribeVpcEndpoints"
+            Resource: "*"
+          # OpenSearch Serverless creates the collection VPC endpoint with the caller's
+          # permissions, so this is limited to that service.
+          - Sid: EC2ManageAossVpcEndpoint
+            Effect: Allow
+            Action:
+              - "ec2:CreateVpcEndpoint"
+              - "ec2:DeleteVpcEndpoints"
+              - "ec2:CreateTags"
+            Resource:
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*"
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:route-table/*"
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc-endpoint/*"
+            Condition:
+              StringEquals:
+                aws:CalledViaFirst: "aoss.amazonaws.com"
+          # The L0 data snippet creates and loads the CustomerOrders table.
+          - Sid: DynamoDBCustomerOrders
+            Effect: Allow
+            Action:
+              - "dynamodb:CreateTable"
+              - "dynamodb:DescribeTable"
+              - "dynamodb:DeleteTable"
+              - "dynamodb:PutItem"
+              - "dynamodb:GetItem"
+              - "dynamodb:Query"
+              - "dynamodb:Scan"
+              - "dynamodb:TagResource"
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/CustomerOrders"
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/CustomerOrders/index/*"
+          # Repositories the starter toolkit creates for the L3 agent images.
+          - Sid: ECRAgentRepositories
+            Effect: Allow
+            Action:
+              - "ecr:CreateRepository"
+              - "ecr:DescribeRepositories"
+              - "ecr:ListImages"
+              - "ecr:BatchDeleteImage"
+              - "ecr:DeleteRepository"
+              - "ecr:TagResource"
+            Resource:
+              - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-agentcore-*"
+          # GetAuthorizationToken does not support resource-level permissions.
+          - Sid: ECRAuthToken
+            Effect: Allow
+            Action:
+              - "ecr:GetAuthorizationToken"
+            Resource: "*"
+          # Projects the starter toolkit creates to build the L3 agent images.
+          - Sid: CodeBuildAgentProjects
+            Effect: Allow
+            Action:
+              - "codebuild:CreateProject"
+              - "codebuild:UpdateProject"
+              - "codebuild:BatchGetProjects"
+              - "codebuild:StartBuild"
+              - "codebuild:BatchGetBuilds"
+              - "codebuild:DeleteProject"
+            Resource:
+              - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/bedrock-agentcore-*"
+          # The L6 helper reads this workshop stack's outputs. Read-only.
+          - Sid: CloudFormationReadWorkshopStack
+            Effect: Allow
+            Action:
+              - "cloudformation:DescribeStacks"
+            Resource:
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*"
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}-*/*"
+
+  # Observability (CloudWatch Logs, X-Ray, CloudWatch Omni, telemetry).
+  WorkshopExecutionPolicyObservability:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Log groups for the workshop agents, Harness, gateways, memory, tool Lambdas
+          # and the X-Ray span group the L6/L7 queries read.
+          - Sid: LogsWorkshopLogGroups
+            Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutRetentionPolicy"
+              - "logs:DeleteLogGroup"
+              - "logs:StartQuery"
+              - "logs:GetQueryResults"
+              # L7 batch evaluation runs under the caller's credentials: it reads
+              # session spans/runtime logs and writes results to
+              # /aws/bedrock-agentcore/evaluations/* as this role.
+              - "logs:PutLogEvents"
+              - "logs:GetLogEvents"
+              - "logs:FilterLogEvents"
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vendedlogs/bedrock-agentcore/*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/anycompany*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/agentcore-eval-*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/bedrock-agentcore-*"
+          # L3 vended log and trace delivery for AgentCore resources in this account.
+          - Sid: LogsDeliveryForAgentCore
+            Effect: Allow
+            Action:
+              - "logs:PutDeliverySource"
+              - "logs:PutDeliveryDestination"
+              - "logs:CreateDelivery"
+              - "logs:GetDelivery"
+              - "logs:DeleteDelivery"
+              - "logs:DeleteDeliveryDestination"
+              - "logs:DeleteDeliverySource"
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:delivery-source:*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:delivery-destination:*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:delivery:*"
+          # These actions do not support resource-level permissions. CloudWatch Logs calls
+          # PutResourcePolicy on the caller's behalf so log delivery can write to the
+          # workshop log groups.
+          - Sid: LogsAccountLevel
+            Effect: Allow
+            Action:
+              - "logs:DescribeLogGroups"
+              - "logs:DescribeDeliverySources"
+              - "logs:DescribeDeliveryDestinations"
+              - "logs:DescribeDeliveries"
+              - "logs:DescribeResourcePolicies"
+              - "logs:DescribeIndexPolicies"
+              - "logs:StopQuery"
+              - "logs:PutIndexPolicy"
+              - "logs:PutResourcePolicy"
+            Resource: "*"
+          # The starter toolkit checks X-Ray Transaction Search. No resource-level permissions.
+          - Sid: XRayTraceSettings
+            Effect: Allow
+            Action:
+              - "xray:GetTraceSegmentDestination"
+              - "xray:GetIndexingRules"
+              - "xray:UpdateTraceSegmentDestination"
+              - "xray:UpdateIndexingRule"
+            Resource: "*"
+          # L6 CloudWatch Omni domain, space and access grants in this account,
+          # including tagging them when they are created.
+          - Sid: CloudWatchOmniResources
+            Effect: Allow
+            Action:
+              - "cloudwatch:GetDomain"
+              - "cloudwatch:DeleteDomain"
+              - "cloudwatch:GetSpace"
+              - "cloudwatch:DeleteSpace"
+              - "cloudwatch:DeleteAccessGrant"
+              - "cloudwatch:GetAccessGrant"
+              - "cloudwatch:TagResource"
+            Resource:
+              - !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:domain/*"
+              - !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:space/*"
+              - !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:access-grant/*"
+          # These actions do not support resource-level permissions.
+          - Sid: CloudWatchOmniCreateAndList
+            Effect: Allow
+            Action:
+              - "cloudwatch:CreateDomain"
+              - "cloudwatch:CreateSpace"
+              - "cloudwatch:CreateAccessGrant"
+              - "cloudwatch:ListDomains"
+              - "cloudwatch:ListAccessGrants"
+              - "cloudwatch:ListSpaces"
+              - "cloudwatch:StartOTelEnrichment"
+              - "cloudwatch:StopOTelEnrichment"
+            Resource: "*"
+          # L6 CloudWatch Omni Dataset Integration in this account.
+          - Sid: ObservabilityAdminDatasetIntegration
+            Effect: Allow
+            Action:
+              - "observabilityadmin:CreateDatasetIntegration"
+              - "observabilityadmin:DeleteDatasetIntegration"
+              - "observabilityadmin:GetDatasetIntegration"
+              - "observabilityadmin:TagResource"
+              - "observabilityadmin:UntagResource"
+              - "observabilityadmin:ListTagsForResource"
+            Resource:
+              - !Sub "arn:aws:observabilityadmin:${AWS::Region}:${AWS::AccountId}:dataset-integration/*"
+          # Telemetry enrichment is an account-level setting with no resource ARN.
+          - Sid: ObservabilityAdminAccountLevel
+            Effect: Allow
+            Action:
+              - "observabilityadmin:StartTelemetryEnrichment"
+              - "observabilityadmin:StopTelemetryEnrichment"
+              - "observabilityadmin:GetTelemetryEnrichmentStatus"
+              - "observabilityadmin:ListDatasetIntegrations"
+            Resource: "*"
+
+  # Storage, configuration, functions and IAM (S3, Lambda, Secrets Manager, Cognito, SSM, IAM).
+  WorkshopExecutionPolicyDataAndIdentity:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # The L1 knowledge base source bucket and the buckets the starter toolkit
+          # creates for agent builds (L3).
+          - Sid: S3WorkshopBuckets
+            Effect: Allow
+            Action:
+              - "s3:CreateBucket"
+              - "s3:DeleteBucket"
+              - "s3:ListBucket"
+              - "s3:GetBucketLocation"
+              - "s3:PutLifecycleConfiguration"
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+              - "s3:AbortMultipartUpload"
+            Resource:
+              - !Sub "arn:aws:s3:::composable-agents-kb-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:aws:s3:::composable-agents-kb-${AWS::AccountId}-${AWS::Region}/*"
+              - !Sub "arn:aws:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:aws:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}/*"
+              - !Sub "arn:aws:s3:::bedrock-agentcore-agent-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:aws:s3:::bedrock-agentcore-agent-${AWS::AccountId}-${AWS::Region}/*"
+          # The Studio lifecycle configuration downloads workshop.zip. Read-only.
+          - Sid: S3ReadWorkshopAssets
+            Effect: Allow
+            Action:
+              - "s3:GetObject"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${AssetsBucketName}"
+              - !Sub "arn:aws:s3:::${AssetsBucketName}/*"
+          # L7 code-based evaluators: AgentCore Evaluations invokes the evaluator
+          # Lambda with the caller's credentials. Only the evaluator function.
+          - Sid: LambdaInvokeEvaluator
+            Effect: Allow
+            Action:
+              - "lambda:InvokeFunction"
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-eval-*"
+          # Only the tool, interceptor and evaluator functions the notebooks create
+          # (anycompany_order_tools, anycompany_refund_tools, anycompany-pii-interceptor,
+          # agentcore-eval-pii-masking-check). The stack's own functions are excluded.
+          - Sid: LambdaNotebookFunctions
+            Effect: Allow
+            Action:
+              - "lambda:CreateFunction"
+              - "lambda:GetFunction"
+              - "lambda:GetFunctionConfiguration"
+              - "lambda:UpdateFunctionCode"
+              - "lambda:UpdateFunctionConfiguration"
+              - "lambda:DeleteFunction"
+              - "lambda:AddPermission"
+              - "lambda:RemovePermission"
+              - "lambda:TagResource"
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:anycompany*"
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:agentcore-eval-*"
+          # The Brave Search key and the AgentCore Identity secrets behind the partner
+          # API-key providers (L3). Secret values are never read by the notebook.
+          - Sid: SecretsManagerWorkshopSecrets
+            Effect: Allow
+            Action:
+              - "secretsmanager:CreateSecret"
+              - "secretsmanager:DescribeSecret"
+              - "secretsmanager:PutSecretValue"
+              - "secretsmanager:DeleteSecret"
+              - "secretsmanager:RestoreSecret"
+              - "secretsmanager:TagResource"
+            Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:anycompany/*"
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!*"
+          # Gateway targets that use an API key credential provider read the stored key
+          # with the caller's identity when the target is created or updated.
+          - Sid: SecretsManagerReadAgentCoreApiKeys
+            Effect: Allow
+            Action: "secretsmanager:GetSecretValue"
+            Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/apikey/anycompany-*"
+          # Sign-in uses InitiateAuth, which needs no IAM permission. Read-only.
+          - Sid: CognitoReadWorkshopPool
+            Effect: Allow
+            Action:
+              - "cognito-idp:DescribeUserPool"
+              - "cognito-idp:DescribeUserPoolClient"
+            Resource:
+              - !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+          # All workshop configuration lives under /anycompany/ in Parameter Store.
+          - Sid: SSMWorkshopParameters
+            Effect: Allow
+            Action:
+              - "ssm:GetParameter"
+              - "ssm:GetParameters"
+              - "ssm:GetParametersByPath"
+              - "ssm:PutParameter"
+              - "ssm:DeleteParameter"
+              - "ssm:DeleteParameters"
+              - "ssm:AddTagsToResource"
+            Resource:
+              - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/*"
+          # DescribeParameters does not support resource-level permissions. Read-only.
+          - Sid: SSMDescribeParameters
+            Effect: Allow
+            Action:
+              - "ssm:DescribeParameters"
+            Resource: "*"
+          # IAM is split so the notebook role can only write to the roles the
+          # labs create, and can never modify itself or the stack's roles.
+          - Sid: AllowIAMRead
+            Effect: Allow
+            Action:
+              - "iam:GetRole"
+              - "iam:GetRolePolicy"
+              - "iam:GetPolicy"
+              - "iam:ListAttachedRolePolicies"
+              - "iam:ListRolePolicies"
+            Resource: "*"
+          # Roles created and deleted by the notebooks: L6 (CloudWatch Omni),
+          # L7 (evaluations) and the AgentCore starter toolkit (CodeBuild role).
+          - Sid: AllowIAMWriteNotebookRoles
+            Effect: Allow
+            Action:
+              - "iam:CreateRole"
+              - "iam:DeleteRole"
+              - "iam:PutRolePolicy"
+              - "iam:DeleteRolePolicy"
+              - "iam:DetachRolePolicy"
+              - "iam:TagRole"
+              - "iam:UpdateAssumeRolePolicy"
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/CloudWatchOmni*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/AgentCoreEvaluationRole*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/agentcore-eval-lambda-role"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/AmazonBedrockAgentCoreSDKCodeBuild-*"
+          # Only the AWS managed policies the labs attach.
+          - Sid: AllowAttachApprovedManagedPolicies
+            Effect: Allow
+            Action: "iam:AttachRolePolicy"
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/CloudWatchOmni*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/agentcore-eval-lambda-role"
+            Condition:
+              ArnEquals:
+                iam:PolicyARN:
+                  - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                  - "arn:aws:iam::aws:policy/CloudWatchOmniSpaceAccessPolicy"
+                  - "arn:aws:iam::aws:policy/CloudWatchOmniAWSIntegrationPolicy"
+                  - "arn:aws:iam::aws:policy/CloudWatchOmniModelInferencePolicy"
+          # Workshop roles the notebooks hand to Bedrock, AgentCore, Lambda,
+          # CodeBuild and CloudWatch. The notebook role itself is not included.
+          - Sid: AllowPassWorkshopRoles
+            Effect: Allow
+            Action: "iam:PassRole"
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/AnyCompany*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/AgentCore*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/composable-agents-kb-role"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/CloudWatchOmni*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/agentcore-eval-lambda-role"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/AmazonBedrockAgentCoreSDKCodeBuild-*"
+          # Service-linked roles (OpenSearch Serverless, AgentCore, etc.) on first use.
+          - Sid: AllowServiceLinkedRoles
+            Effect: Allow
+            Action: "iam:CreateServiceLinkedRole"
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/*"
+
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - WorkshopExecutionPolicy
+      - WorkshopExecutionPolicyModels
+      - WorkshopExecutionPolicyObservability
+      - WorkshopExecutionPolicyDataAndIdentity
+    Properties:
+      RoleName: !Sub "${ParentStackName}-SageMakerExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub "${AWS::AccountId}"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:*:${AWS::AccountId}:*"
+      Path: /
+      ManagedPolicyArns:
+        - !Ref WorkshopExecutionPolicy
+        - !Ref WorkshopExecutionPolicyModels
+        - !Ref WorkshopExecutionPolicyObservability
+        - !Ref WorkshopExecutionPolicyDataAndIdentity
+        - arn:aws:iam::aws:policy/AmazonBedrockLimitedAccess
+        - arn:aws:iam::aws:policy/AmazonBedrockReadOnly
+
+
+  # ---------------------------------------------------------------------------
+  # SageMaker AI Studio Domain, User Profile, and JupyterLab Space
+  # ---------------------------------------------------------------------------
+  StudioDomain:
+    Type: AWS::SageMaker::Domain
+    DependsOn: SageMakerExecutionRole
+    Properties:
+      AppNetworkAccessType: PublicInternetOnly
+      AuthMode: IAM
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        StudioWebPortal: ENABLED
+        StudioWebPortalSettings:
+          HiddenAppTypes:
+            - Canvas
+            - JupyterServer
+            - RStudioServerPro
+            - TensorBoard
+            - DetailedProfiler
+          HiddenMlTools:
+            - FeatureStore
+            - EmrClusters
+      DomainName: !Ref DomainName
+      SubnetIds: !GetAtt DefaultVpcFinder.Subnets
+      VpcId: !GetAtt DefaultVpcFinder.VpcId
+      DefaultSpaceSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+      DomainSettings:
+        DockerSettings:
+          EnableDockerAccess: ENABLED
+      Tags:
+        - Key: env
+          Value: aapcf-workshop
+
+
+  UserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !GetAtt StudioDomain.DomainId
+      UserProfileName: !Ref UserProfileName
+      UserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+      Tags:
+        - Key: env
+          Value: aapcf-workshop
+        - Key: user
+          Value: !Ref UserProfileName
+
+
+  JupyterLabSpace:
+    Type: AWS::SageMaker::Space
+    DependsOn: UserProfile
+    Properties:
+      DomainId: !GetAtt StudioDomain.DomainId
+      SpaceName: !Ref SpaceName
+      SpaceSettings:
+        AppType: JupyterLab
+        SpaceStorageSettings:
+          EbsStorageSettings:
+            EbsVolumeSizeInGb: 100
+        JupyterLabAppSettings:
+          DefaultResourceSpec:
+            InstanceType: !FindInMap [RegionMap, !Ref "AWS::Region", instance]
+      SpaceSharingSettings:
+        SharingType: Private
+      OwnershipSettings:
+        OwnerUserProfileName: !Ref UserProfileName
+
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle config: download and unzip workshop content on space start
+  # ---------------------------------------------------------------------------
+  LifeCycleConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub 'LccPolicy-${ParentStackName}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateStudioLifecycleConfig
+                  - sagemaker:DeleteStudioLifecycleConfig
+                  - sagemaker:UpdateUserProfile
+                Resource: "*"
+
+
+  LifeCycleConfigLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: UserProfile
+    Properties:
+      Description: Attach lifecycle config to JupyterLab space to sync workshop content
+      Handler: index.lambda_handler
+      Role: !GetAtt LifeCycleConfigLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Environment:
+        Variables:
+          DOMAIN_ID: !GetAtt StudioDomain.DomainId
+          USER_PROFILE_NAME: !Ref UserProfileName
+          LCC_NAME: !Sub '${ParentStackName}-sync-content'
+          ASSETS_BUCKET: !Ref AssetsBucketName
+          ASSETS_PREFIX: !Ref AssetsBucketPrefix
+          STACK_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import boto3
+          import base64
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          def _send(event, context, status, data=None, physical=None):
+              import json, urllib.request
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+          import os
+
+          client = boto3.client('sagemaker')
+
+          def lambda_handler(event, context):
+              domain_id    = os.environ['DOMAIN_ID']
+              user_profile = os.environ['USER_PROFILE_NAME']
+              lcc_name     = os.environ['LCC_NAME']
+              bucket       = os.environ['ASSETS_BUCKET']
+              prefix       = os.environ['ASSETS_PREFIX'].rstrip('/')
+              region       = os.environ['STACK_REGION']
+
+              try:
+                  if event.get('RequestType') == 'Delete':
+                      try:
+                          client.delete_studio_lifecycle_config(StudioLifecycleConfigName=lcc_name)
+                      except Exception as e:
+                          print('Delete LCC (may not exist): ' + str(e))
+                      _send(event, context, SUCCESS, {})
+                      return
+
+                  # Delete existing LCC if present, then recreate
+                  try:
+                      client.delete_studio_lifecycle_config(StudioLifecycleConfigName=lcc_name)
+                  except Exception:
+                      pass
+
+                  s3_path = 's3://' + bucket + '/' + prefix + '/workshop.zip'
+                  script = (
+                      '#!/bin/bash\n'
+                      'aws s3 cp ' + s3_path + ' /tmp/ca.zip --region ' + region + ' '
+                      '&& unzip -o /tmp/ca.zip -d /home/sagemaker-user/pluggable-agentic-ai-framework '
+                      '&& rm /tmp/ca.zip '
+                      '|| echo "WARNING: Could not sync workshop content"\n'
+                      'mkdir -p /home/sagemaker-user/.jupyter\n'
+                      'cat > /home/sagemaker-user/.jupyter/jupyter_server_config.py << \'JCONF\'\n'
+                      'c.ContentsManager.hide_globs = ["__pycache__", "*.pyc", ".*", "lost+found"]\n'
+                      'JCONF\n'
+                      'mkdir -p /home/sagemaker-user/.jupyter/lab/user-settings/@jupyterlab/filebrowser-extension\n'
+                      'cat > /home/sagemaker-user/.jupyter/lab/user-settings/@jupyterlab/filebrowser-extension/browser.jupyterlab-settings << \'LSETTINGS\'\n'
+                      '{"showHiddenFiles": false}\n'
+                      'LSETTINGS\n'
+                      'exit 0\n'
+                  )
+
+                  b64 = base64.b64encode(script.encode('utf-8')).decode('utf-8')
+                  resp = client.create_studio_lifecycle_config(
+                      StudioLifecycleConfigName=lcc_name,
+                      StudioLifecycleConfigContent=b64,
+                      StudioLifecycleConfigAppType='JupyterLab',
+                  )
+                  lcc_arn = resp['StudioLifecycleConfigArn']
+
+                  client.update_user_profile(
+                      DomainId=domain_id,
+                      UserProfileName=user_profile,
+                      UserSettings={
+                          'JupyterLabAppSettings': {
+                              'DefaultResourceSpec': {'LifecycleConfigArn': lcc_arn},
+                              'LifecycleConfigArns': [lcc_arn]
+                          }
+                      }
+                  )
+                  _send(event, context, SUCCESS, {'LccArn': lcc_arn})
+
+              except Exception as e:
+                  print('Error: ' + str(e))
+                  _send(event, context, FAILED, {'Error': str(e)})
+
+
+  LifeCycleConfigInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: UserProfile
+    Properties:
+      ServiceToken: !GetAtt LifeCycleConfigLambda.Arn
+
+
+  # ---------------------------------------------------------------------------
+  # Auto-start JupyterLab Space after provisioning
+  # ---------------------------------------------------------------------------
+  StartJupyterLabSpaceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerAppManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # StartJupyterLabSpaceFunction only starts, polls and stops the
+              # JupyterLab app in this stack's Studio domain.
+              - Sid: ManageJupyterLabApp
+                Effect: Allow
+                Action:
+                  - sagemaker:CreateApp
+                  - sagemaker:DescribeApp
+                  - sagemaker:DeleteApp
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${StudioDomain.DomainId}/*"
+              # SageMaker tags the app on create, so tag-on-create is required.
+              - Sid: TagAppOnCreate
+                Effect: Allow
+                Action: sagemaker:AddTags
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:app/${StudioDomain.DomainId}/*"
+                Condition:
+                  "Null":
+                    sagemaker:TaggingAction: "false"
+
+
+  StartJupyterLabSpaceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ParentStackName}-start-jupyterlab'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt StartJupyterLabSpaceRole.Arn
+      Timeout: 600
+      Environment:
+        Variables:
+          DOMAIN_ID: !GetAtt StudioDomain.DomainId
+          SPACE_NAME: !Ref SpaceName
+          INSTANCE_TYPE: !FindInMap [RegionMap, !Ref "AWS::Region", instance]
+          IMAGE_ARN: !FindInMap [RegionMap, !Ref "AWS::Region", jupyter]
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore.exceptions
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          def _send(event, context, status, data=None, physical=None):
+              import json, urllib.request
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+          import os
+          import time
+
+          def lambda_handler(event, context):
+              sm = boto3.client('sagemaker')
+              domain_id     = os.environ['DOMAIN_ID']
+              space_name    = os.environ['SPACE_NAME']
+              instance_type = os.environ['INSTANCE_TYPE']
+              image_arn     = os.environ['IMAGE_ARN']
+
+              try:
+                  if event['RequestType'] == 'Delete':
+                      try:
+                          sm.delete_app(
+                              DomainId=domain_id, SpaceName=space_name,
+                              AppType='JupyterLab', AppName='default'
+                          )
+                          for _ in range(30):
+                              time.sleep(10)
+                              try:
+                                  status = sm.describe_app(
+                                      DomainId=domain_id, SpaceName=space_name,
+                                      AppType='JupyterLab', AppName='default'
+                                  ).get('Status')
+                                  if status == 'Deleted':
+                                      break
+                              except botocore.exceptions.ClientError as e:
+                                  if e.response['Error']['Code'] == 'ResourceNotFound':
+                                      break
+                      except Exception as e:
+                          print('Delete app error: ' + str(e))
+                      _send(event, context, SUCCESS, {})
+                      return
+
+                  if event['RequestType'] in ['Create', 'Update']:
+                      try:
+                          resp = sm.describe_app(
+                              DomainId=domain_id, SpaceName=space_name,
+                              AppType='JupyterLab', AppName='default'
+                          )
+                          existing_status = resp.get('Status', '')
+                          print('Existing app status: ' + existing_status)
+                          if existing_status in ['InService', 'Pending']:
+                              _send(event, context, SUCCESS,
+                                  {'AppStatus': existing_status})
+                              return
+                      except botocore.exceptions.ClientError as e:
+                          if e.response['Error']['Code'] != 'ResourceNotFound':
+                              raise
+
+                      print('Creating JupyterLab app in space ' + space_name)
+                      create_resp = sm.create_app(
+                          DomainId=domain_id,
+                          SpaceName=space_name,
+                          AppType='JupyterLab',
+                          AppName='default',
+                          ResourceSpec={
+                              'InstanceType': instance_type,
+                              'SageMakerImageArn': image_arn,
+                          }
+                      )
+                      app_arn = create_resp.get('AppArn', '')
+                      print('App ARN: ' + app_arn)
+
+                      for i in range(48):
+                          time.sleep(10)
+                          try:
+                              status = sm.describe_app(
+                                  DomainId=domain_id, SpaceName=space_name,
+                                  AppType='JupyterLab', AppName='default'
+                              ).get('Status', '')
+                          except Exception as e:
+                              print('Status check error: ' + str(e))
+                              continue
+                          print('Poll ' + str(i+1) + ': status=' + status)
+                          if status == 'InService':
+                              _send(event, context, SUCCESS,
+                                  {'AppArn': app_arn, 'AppStatus': 'InService'})
+                              return
+                          elif status == 'Failed':
+                              _send(event, context, FAILED,
+                                  {'AppArn': app_arn, 'AppStatus': 'Failed',
+                                   'Error': 'JupyterLab app entered Failed state'})
+                              return
+
+                      print('Timeout reached, app still starting')
+                      _send(event, context, SUCCESS,
+                          {'AppArn': app_arn, 'AppStatus': 'Pending'})
+
+              except Exception as e:
+                  print('Unhandled error: ' + str(e))
+                  _send(event, context, FAILED, {'Error': str(e)})
+
+
+  StartJupyterLabSpace:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: JupyterLabSpace
+    Properties:
+      ServiceToken: !GetAtt StartJupyterLabSpaceFunction.Arn
+      ServiceTimeout: 600
+
+Outputs:
+  SageMakerDomainId:
+    Description: SageMaker Studio Domain ID
+    Value: !GetAtt StudioDomain.DomainId
+
+  SageMakerExecutionRoleArn:
+    Description: ARN of the SageMaker Execution Role
+    Value: !GetAtt SageMakerExecutionRole.Arn
+
+  JupyterLabAppStatus:
+    Description: Status of the JupyterLab app at stack creation time
+    Value: !GetAtt StartJupyterLabSpace.AppStatus

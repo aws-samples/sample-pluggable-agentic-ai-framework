@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  L1 Data & Knowledge — DynamoDB CustomerOrders table with sample data, and the S3 bucket + IAM role used by the knowledge-base notebook.
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in physical resource names so they stay
+      the same as in the single-stack template (a nested stack's own name is auto-generated).
+
+
+  AssetsBucketName:
+    Type: String
+    Description: S3 bucket name holding workshop.zip (Workshop Studio injects this; supply your own when self-deploying).
+
+
+  AssetsBucketPrefix:
+    Type: String
+    Description: S3 prefix for workshop.zip (Workshop Studio injects this; supply your own when self-deploying).
+
+Resources:
+
+
+  # ---------------------------------------------------------------------------
+  # Data Layer — DynamoDB CustomerOrders table (universal, all stacks)
+  # ---------------------------------------------------------------------------
+  CustomerOrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CustomerOrders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: productName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customerId
+          KeyType: HASH
+        - AttributeName: orderId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: OrderIdIndex
+          KeySchema:
+            - AttributeName: orderId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: CategoryIndex
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ProductNameIndex
+          KeySchema:
+            - AttributeName: productName
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Application
+          Value: ComposableAgentsWorkshop
+
+
+  # ---------------------------------------------------------------------------
+  # Data Layer — Sample data loader (reads JSON from WS assets, writes to DDB)
+  # ---------------------------------------------------------------------------
+  SampleDataLoaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SampleDataLoaderAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${AssetsBucketName}"
+                  - !Sub "arn:aws:s3:::${AssetsBucketName}/${AssetsBucketPrefix}*"
+              - Effect: Allow
+                Action: dynamodb:BatchWriteItem
+                Resource: !GetAtt CustomerOrdersTable.Arn
+
+
+  SampleDataLoaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-SampleDataLoader"
+      # python3.12 — cfnresponse logic is vendored inline using stdlib urllib
+      # below, so no runtime-provided module is needed.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt SampleDataLoaderRole.Arn
+      Environment:
+        Variables:
+          ASSETS_BUCKET: !Ref AssetsBucketName
+          ASSETS_PREFIX: !Ref AssetsBucketPrefix
+          ORDERS_TABLE: !Ref CustomerOrdersTable
+      Code:
+        ZipFile: |
+          # NOTE: We vendor the cfn-response logic via stdlib urllib instead of
+          # importing cfnresponse. Modern Lambda runtimes do NOT auto-bundle
+          # cfnresponse.py into inline ZipFile deployments. Older Lambdas in
+          # this stack still have the module because it was auto-injected when
+          # they were originally created — we can't rely on that for new ones.
+          import json, os, urllib.request, boto3
+          from datetime import datetime, timezone
+          from decimal import Decimal
+          from boto3.dynamodb.types import TypeSerializer
+
+          CFN_SUCCESS = "SUCCESS"
+          CFN_FAILED = "FAILED"
+
+          def cfn_send(event, context, status, data=None, reason=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or ("See CloudWatch log stream: " + context.log_stream_name),
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      print("CFN response status:", resp.status)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+
+          s3 = boto3.client("s3")
+          ddb = boto3.client("dynamodb")
+
+          def _coerce_numbers(obj):
+              """DynamoDB rejects Python float — convert to Decimal before serializing."""
+              if isinstance(obj, float):
+                  return Decimal(str(obj))
+              if isinstance(obj, dict):
+                  return {k: _coerce_numbers(v) for k, v in obj.items()}
+              if isinstance(obj, list):
+                  return [_coerce_numbers(v) for v in obj]
+              return obj
+
+          def load_orders(assets_bucket, assets_prefix, table):
+              key = assets_prefix.rstrip("/") + "/sample-data/customer_orders_data.json"
+              body = s3.get_object(Bucket=assets_bucket, Key=key)["Body"].read()
+              orders = json.loads(body)
+              # Dates in the file are written relative to "_reference_date" (the
+              # workshop day). Shift them by (now - reference) so the mix of
+              # refund-eligible and expired orders holds whenever the stack deploys.
+              ref = next((o["_reference_date"] for o in orders if "_reference_date" in o), None)
+              if ref:
+                  shift = datetime.now(timezone.utc) - datetime.fromisoformat(ref.replace("Z", "+00:00"))
+                  for o in orders:
+                      for f in ("orderDate", "deliveredAt"):
+                          if o.get(f):
+                              t = datetime.fromisoformat(o[f].replace("Z", "+00:00")) + shift
+                              o[f] = t.strftime("%Y-%m-%dT%H:%M:%SZ")
+              # Skip the compliance-notice synthetic record if present
+              items = [_coerce_numbers(o) for o in orders if "customerId" in o and "orderId" in o]
+
+              serializer = TypeSerializer()
+              count = 0
+              # BatchWriteItem is capped at 25 items per call
+              for i in range(0, len(items), 25):
+                  batch = items[i:i + 25]
+                  requests = [
+                      {"PutRequest": {"Item": {k: serializer.serialize(v) for k, v in it.items()}}}
+                      for it in batch
+                  ]
+                  resp = ddb.batch_write_item(RequestItems={table: requests})
+                  # Retry any unprocessed items (rare for small batches, but safe)
+                  while resp.get("UnprocessedItems"):
+                      resp = ddb.batch_write_item(RequestItems=resp["UnprocessedItems"])
+                  count += len(batch)
+              return count
+
+          def lambda_handler(event, context):
+              print("Event:", json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              try:
+                  rt = event["RequestType"]
+                  assets_bucket = os.environ["ASSETS_BUCKET"]
+                  assets_prefix = os.environ["ASSETS_PREFIX"]
+                  orders_table  = os.environ["ORDERS_TABLE"]
+
+                  if rt in ("Create", "Update"):
+                      order_count = load_orders(assets_bucket, assets_prefix, orders_table)
+                      cfn_send(event, context, CFN_SUCCESS, {"OrdersLoaded": order_count})
+                  elif rt == "Delete":
+                      # Table itself gets deleted by CFN; no need to clear rows.
+                      cfn_send(event, context, CFN_SUCCESS)
+                  else:
+                      cfn_send(event, context, CFN_FAILED, reason="Unknown RequestType: " + rt)
+              except Exception as e:
+                  print("Error:", str(e))
+                  cfn_send(event, context, CFN_FAILED, reason=str(e))
+
+
+  SampleDataLoader:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - CustomerOrdersTable
+    Properties:
+      ServiceToken: !GetAtt SampleDataLoaderFunction.Arn
+      # Short timeout so a Lambda failure fails the stack in minutes, not the
+      # 1-hour default. Rollback also respects this ceiling.
+      ServiceTimeout: 300
+
+
+  # ---------------------------------------------------------------------------
+  # SSM Parameters — Data Layer (consumed by L3 Order Agent + downstream)
+  # ---------------------------------------------------------------------------
+  SsmDynamoDBOrdersTable:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/dynamodb_orders_table
+      Type: String
+      Value: !Ref CustomerOrdersTable
+
+
+  # --- Cognito test users + shared permanent password (custom resource) ---
+  # CloudFormation can create a UserPoolUser but cannot set a *permanent* password,
+  # so this mirrors the notebook: create gold/silver/bronze, set permanent passwords,
+  # and store the shared password at /anycompany/agentcore/user_password (SecureString).
+  # ---------------------------------------------------------------------------
+  # Data Layer — Knowledge Base support (bucket + IAM role shared by L1
+  # unstructured providers). The Bedrock KB ingest snippet uploads the
+  # return-policy docs to this bucket and reads from it. Couchbase
+  # participants skip the bucket entirely (they ingest from POLICY_DOCS
+  # in memory).
+  # ---------------------------------------------------------------------------
+  KBSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "composable-agents-kb-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: workshop
+          Value: aapcf
+
+
+  KBSourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KBSourceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBedrockKBRead
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt KBSourceBucket.Arn
+              - !Sub "${KBSourceBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+
+  # Bedrock KB execution role — Bedrock assumes this to read S3, invoke the
+  # Titan embedding model, and call the AOSS collection the notebook creates.
+  # Unused if the participant picks Couchbase; costs nothing to leave idle.
+  KBExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: composable-agents-kb-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            # NOTE: SourceAccount only — not SourceArn. On the first
+            # CreateKnowledgeBase call the KB does not exist yet, so Bedrock
+            # cannot populate aws:SourceArn and the assume-role fails with
+            # 'Bedrock Knowledge Base was unable to assume the given role.'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Path: /
+      Policies:
+        - PolicyName: KBPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3DataBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KBSourceBucket.Arn
+                  - !Sub "${KBSourceBucket.Arn}/*"
+              - Sid: BedrockModels
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+              - Sid: OpenSearchServerlessAccess
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+
+
+  # ---------------------------------------------------------------------------
+  # SSM Parameters — Knowledge Base support (consumed by L1 unstructured notebook)
+  # ---------------------------------------------------------------------------
+  SsmKBBucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/s3_bucket
+      Type: String
+      Value: !Ref KBSourceBucket
+
+
+  SsmKBRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/kb_role_arn
+      Type: String
+      Value: !GetAtt KBExecutionRole.Arn
+
+Outputs:
+
+  CustomerOrdersTableName:
+    Description: DynamoDB table pre-loaded with sample customer orders
+    Value: !Ref CustomerOrdersTable
+
+  CustomerOrdersTableArn:
+    Description: ARN of the DynamoDB table (useful for IAM policy writing)
+    Value: !GetAtt CustomerOrdersTable.Arn
+
+  SampleDataLoaderFunctionName:
+    Description: Lambda custom resource that loads sample orders at stack create time
+    Value: !Ref SampleDataLoaderFunction
+
+  KBSourceBucketName:
+    Description: S3 bucket where the L1 notebook uploads return-policy documents
+    Value: !Ref KBSourceBucket
+
+  KBExecutionRoleArn:
+    Description: IAM role Bedrock assumes to read S3, invoke Titan, and call OpenSearch
+    Value: !GetAtt KBExecutionRole.Arn

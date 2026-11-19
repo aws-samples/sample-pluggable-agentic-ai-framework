@@ -1,0 +1,879 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  L5 Decision Models — Strands Decider on a SageMaker endpoint, provisioned in the background (GPU instance pools first, then CPU).
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in physical resource names so they stay
+      the same as in the single-stack template (a nested stack's own name is auto-generated).
+
+  DeciderModel:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$'
+    Description: Hugging Face Hub id of the Strands Decider model (org/name).
+
+  DeciderModelRevision:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+    Description: Model revision on the Hugging Face Hub. Use a release date tag (YYMMDD) to pin it.
+
+  DeciderRepoCommit:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{40}$'
+    Description: strands-labs/strands-decider commit whose Dockerfile and fetch script are used.
+
+  DeciderGpuInstanceTypes:
+    Type: String
+    AllowedPattern: '^(ml\.[a-z0-9-]+\.[a-z0-9]+(,ml\.[a-z0-9-]+\.[a-z0-9]+){0,4})?$'
+    Description: >
+      GPU instance pools, highest priority first (up to 5, comma-separated). Tried before the CPU
+      pools. Use NVIDIA types with local NVMe storage (ml.g5, ml.g6, ml.g6e). Empty skips GPU.
+
+  DeciderCpuInstanceTypes:
+    Type: String
+    AllowedPattern: '^ml\.[a-z0-9-]+\.[a-z0-9]+(,ml\.[a-z0-9-]+\.[a-z0-9]+){0,4}$'
+    Description: >
+      CPU fallback instance pools, highest priority first (up to 5). Used when no GPU pool has capacity
+      or quota. Use x86 types without local storage and more than 9 GB of memory (ml.m5, ml.c6i, ml.r5).
+
+Resources:
+
+
+  # ===========================================================================
+  # L5 Strands Decider — pre-provisioned SageMaker endpoint
+  #
+  # Runs in the background so the rest of the stack never waits on (or rolls
+  # back because of) GPU capacity:
+  #   custom resource -> Step Functions -> CodeBuild
+  #     1. in parallel: model weights to S3, cuda image, cpu image (to ECR)
+  #     2. endpoint: GPU instance pools first, then CPU instance pools
+  # Progress and the result are published to SSM:
+  #   /anycompany/agentcore/decider_status          PROVISIONING... | READY | FAILED: <reason>
+  #   /anycompany/agentcore/decider_endpoint_name   set when READY
+  #   /anycompany/agentcore/decider_instance_type   the instance type it landed on
+  #   /anycompany/agentcore/decider_device          cuda | cpu
+  # ===========================================================================
+  DeciderModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+
+  DeciderModelBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeciderModelBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DeciderModelBucket.Arn
+              - !Sub "${DeciderModelBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+
+  DeciderImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+
+  # Role the SageMaker endpoint runs as: read the model, pull the image, write logs.
+  DeciderEndpointRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: DeciderEndpoint
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadModel
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DeciderModelBucket.Arn
+                  - !Sub "${DeciderModelBucket.Arn}/*"
+              - Sid: PullImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !GetAtt DeciderImageRepository.Arn
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*"
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    cloudwatch:namespace: "/aws/sagemaker/*"
+
+
+  # Role for all four CodeBuild targets (model, cuda, cpu, endpoint).
+  DeciderBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: DeciderBuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ParentStackName}-decider-build*"
+              - Sid: WriteModel
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DeciderModelBucket.Arn
+                  - !Sub "${DeciderModelBucket.Arn}/*"
+              - Sid: PushImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt DeciderImageRepository.Arn
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: DeployEndpoint
+                Effect: Allow
+                Action:
+                  - sagemaker:CreateModel
+                  - sagemaker:DescribeModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:DescribeEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:DeleteEndpoint
+                Resource:
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model/*-decider-*"
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/*-decider-*"
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*-decider-*"
+              - Sid: PassEndpointRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt DeciderEndpointRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: sagemaker.amazonaws.com
+              - Sid: PublishResult
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/decider_*"
+
+
+  DeciderBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ParentStackName}-decider-build"
+      Description: Builds the Strands Decider model data and images, then creates its SageMaker endpoint.
+      ServiceRole: !GetAtt DeciderBuildRole.Arn
+      TimeoutInMinutes: 180
+      QueuedTimeoutInMinutes: 120
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: TARGET, Value: unset }
+          - { Name: REPO_URL, Value: https://github.com/strands-labs/strands-decider.git }
+          - { Name: REPO_COMMIT, Value: !Ref DeciderRepoCommit }
+          - { Name: MODEL, Value: !Ref DeciderModel }
+          - { Name: MODEL_REVISION, Value: !Ref DeciderModelRevision }
+          - { Name: MODEL_DATA_URI, Value: !Sub "s3://${DeciderModelBucket}/decider/${DeciderModelRevision}/" }
+          - { Name: IMAGE_REPO_URI, Value: !GetAtt DeciderImageRepository.RepositoryUri }
+          - { Name: CHECKPOINT, Value: !Join ["", ["/opt/ml/model/", !Select [1, !Split ["/", !Ref DeciderModel]]]] }
+          - { Name: NAME_PREFIX, Value: !Sub "${ParentStackName}-decider" }
+          - { Name: SSM_PREFIX, Value: /anycompany/agentcore }
+          - { Name: ENDPOINT_ROLE_ARN, Value: !GetAtt DeciderEndpointRole.Arn }
+          - { Name: GPU_INSTANCE_TYPES, Value: !Ref DeciderGpuInstanceTypes }
+          - { Name: CPU_INSTANCE_TYPES, Value: !Ref DeciderCpuInstanceTypes }
+          - { Name: GPU_AMI_VERSION, Value: al2023-ami-sagemaker-inference-gpu-4-1 }
+          - { Name: PROVISION_TIMEOUT_SECONDS, Value: "900" }
+          # Versions the decider's deploy/sagemaker/package.json pins, and a boto3 with InstancePools.
+          - { Name: HF_HUB_VERSION, Value: 2.17.8 }
+          - { Name: TSX_VERSION, Value: 4.23.15 }
+          - { Name: BOTO3_VERSION, Value: 1.43.118 }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 22
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  echo "TARGET=$TARGET"
+                  if [ "$TARGET" != "endpoint" ]; then
+                    git init -q src
+                    git -C src remote add origin "$REPO_URL"
+                    git -C src fetch -q --depth 1 origin "$REPO_COMMIT"
+                    git -C src checkout -q FETCH_HEAD
+                  fi
+                  case "$TARGET" in
+                    model)
+                      # The decider's own fetch script: model + base model, laid out for /opt/ml/model.
+                      mkdir -p /tmp/fetch
+                      cp src/deploy/sagemaker/scripts/fetch-model.ts /tmp/fetch/
+                      cd /tmp/fetch
+                      npm install --no-save --no-audit --no-fund "@huggingface/hub@$HF_HUB_VERSION" "tsx@$TSX_VERSION"
+                      npx tsx fetch-model.ts "$MODEL" "$MODEL_REVISION" out
+                      aws s3 sync out "$MODEL_DATA_URI" --only-show-errors
+                      ;;
+                    cuda|cpu)
+                      cd src
+                      aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${IMAGE_REPO_URI%%/*}"
+                      DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f deploy/sagemaker/Dockerfile --build-arg "DEVICE=$TARGET" -t "$IMAGE_REPO_URI:$TARGET" .
+                      docker push "$IMAGE_REPO_URI:$TARGET"
+                      ;;
+                    endpoint)
+                      # Pinned boto3: InstancePools (multi-instance-type fallback) is a 2026 API.
+                      python3 -m venv /tmp/venv
+                      /tmp/venv/bin/pip install --quiet "boto3==$BOTO3_VERSION"
+                      cat > /tmp/deploy_endpoint.py <<'PY'
+                  """Create the Strands Decider endpoint, falling back from GPU pools to CPU pools."""
+                  import os
+                  import sys
+                  import time
+
+                  import boto3
+                  from botocore.exceptions import ClientError
+
+                  PREFIX = os.environ["NAME_PREFIX"]
+                  SSM_PREFIX = os.environ["SSM_PREFIX"]
+                  ROLE_ARN = os.environ["ENDPOINT_ROLE_ARN"]
+                  IMAGE_REPO_URI = os.environ["IMAGE_REPO_URI"]
+                  MODEL_DATA_URI = os.environ["MODEL_DATA_URI"]
+                  CHECKPOINT = os.environ["CHECKPOINT"]
+                  GPU_AMI = os.environ.get("GPU_AMI_VERSION", "al2023-ami-sagemaker-inference-gpu-4-1")
+                  PROVISION_TIMEOUT = int(os.environ.get("PROVISION_TIMEOUT_SECONDS", "900"))
+                  POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
+                  TRANSITIONAL = {"Creating", "Updating", "SystemUpdating", "RollingBack"}
+
+                  sm = boto3.client("sagemaker")
+                  ssm = boto3.client("ssm")
+
+
+                  def log(msg):
+                      print(msg, flush=True)
+
+
+                  def put(name, value):
+                      ssm.put_parameter(Name=f"{SSM_PREFIX}/{name}", Value=value, Type="String", Overwrite=True)
+
+
+                  def pools(csv):
+                      types = [t.strip() for t in csv.split(",") if t.strip()]
+                      if len(types) > 5:
+                          raise ValueError(f"At most 5 instance types per pool list, got {len(types)}: {types}")
+                      return [{"InstanceType": t, "Priority": i + 1} for i, t in enumerate(types)]
+
+
+                  def not_found(err):
+                      return "Could not find" in err.response.get("Error", {}).get("Message", "")
+
+
+                  def ensure_model(name, device):
+                      try:
+                          sm.describe_model(ModelName=name)
+                          log(f"model {name} exists")
+                          return
+                      except ClientError as e:
+                          if not not_found(e):
+                              raise
+                      # The execution role is new; IAM can take a few seconds to propagate.
+                      for attempt in range(8):
+                          try:
+                              sm.create_model(
+                                  ModelName=name,
+                                  ExecutionRoleArn=ROLE_ARN,
+                                  PrimaryContainer={
+                                      "Image": f"{IMAGE_REPO_URI}:{device}",
+                                      "ModelDataSource": {"S3DataSource": {
+                                          "S3Uri": MODEL_DATA_URI, "S3DataType": "S3Prefix", "CompressionType": "None"}},
+                                      "Environment": {"DECIDER_CHECKPOINT": CHECKPOINT, "DECIDER_DEVICE": device, "DECIDER_ARGS": ""},
+                                  },
+                              )
+                              log(f"created model {name} ({device})")
+                              return
+                          except ClientError as e:
+                              if attempt == 7:
+                                  raise
+                              log(f"create_model {name} retry {attempt + 1}: {e}")
+                              time.sleep(15)
+
+
+                  def ensure_config(name, model, device, pool_list):
+                      try:
+                          sm.describe_endpoint_config(EndpointConfigName=name)
+                          log(f"endpoint config {name} exists")
+                          return
+                      except ClientError as e:
+                          if not not_found(e):
+                              raise
+                      variant = {
+                          "VariantName": "AllTraffic",
+                          "ModelName": model,
+                          "InitialInstanceCount": 1,
+                          "InitialVariantWeight": 1.0,
+                          "InstancePools": pool_list,
+                          "VariantInstanceProvisionTimeoutInSeconds": PROVISION_TIMEOUT,
+                          "ModelDataDownloadTimeoutInSeconds": 3600,
+                          "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
+                      }
+                      if device == "cuda":
+                          # GPU hosts need the AL2023 AMI (NVIDIA driver 580) for the image's CUDA 12.6.
+                          variant["InferenceAmiVersion"] = GPU_AMI
+                      else:
+                          # CPU types without local NVMe need an EBS volume for the model.
+                          variant["VolumeSizeInGB"] = 128
+                      sm.create_endpoint_config(EndpointConfigName=name, ProductionVariants=[variant])
+                      log(f"created endpoint config {name}: {[p['InstanceType'] for p in pool_list]}")
+
+
+                  def wait(endpoint):
+                      while True:
+                          desc = sm.describe_endpoint(EndpointName=endpoint)
+                          status = desc["EndpointStatus"]
+                          if status == "InService":
+                              return True, desc
+                          if status not in TRANSITIONAL:
+                              return False, desc
+                          log(f"{endpoint}: {status}")
+                          time.sleep(POLL_SECONDS)
+
+
+                  def deploy(endpoint, config):
+                      try:
+                          desc = sm.describe_endpoint(EndpointName=endpoint)
+                          log(f"endpoint {endpoint} exists ({desc['EndpointStatus']})")
+                      except ClientError as e:
+                          if not not_found(e):
+                              raise
+                          try:
+                              sm.create_endpoint(EndpointName=endpoint, EndpointConfigName=config)
+                              log(f"creating endpoint {endpoint}")
+                          except ClientError as ce:
+                              # e.g. ResourceLimitExceeded when the account has no quota for these types.
+                              return False, None, f"{ce.response['Error'].get('Code')}: {ce.response['Error'].get('Message')}"
+                      ok, desc = wait(endpoint)
+                      return ok, desc, (None if ok else desc.get("FailureReason", desc["EndpointStatus"]))
+
+
+                  def delete_endpoint(endpoint):
+                      try:
+                          sm.delete_endpoint(EndpointName=endpoint)
+                          log(f"deleted failed endpoint {endpoint}")
+                      except ClientError as e:
+                          log(f"delete {endpoint}: {e}")
+
+
+                  def landed_instance_type(desc, pool_list):
+                      variant = desc["ProductionVariants"][0]
+                      active = [p["InstanceType"] for p in variant.get("InstancePools", []) if p.get("CurrentInstanceCount", 0) > 0]
+                      return active[0] if active else (pool_list[0]["InstanceType"] if len(pool_list) == 1 else "unknown")
+
+
+                  def main():
+                      attempts = []
+                      gpu = pools(os.environ.get("GPU_INSTANCE_TYPES", ""))
+                      cpu = pools(os.environ.get("CPU_INSTANCE_TYPES", ""))
+                      if gpu:
+                          attempts.append(("cuda", gpu))
+                      if cpu:
+                          attempts.append(("cpu", cpu))
+                      if not attempts:
+                          put("decider_status", "FAILED: no GPU or CPU instance types configured")
+                          return 1
+
+                      reasons = []
+                      for device, pool_list in attempts:
+                          tier = "gpu" if device == "cuda" else "cpu"
+                          model, config, endpoint = f"{PREFIX}-{device}-model", f"{PREFIX}-{tier}-config", f"{PREFIX}-{tier}"
+                          put("decider_status", f"PROVISIONING: trying {tier} pools {[p['InstanceType'] for p in pool_list]}")
+                          ensure_model(model, device)
+                          ensure_config(config, model, device, pool_list)
+                          ok, desc, reason = deploy(endpoint, config)
+                          if ok:
+                              instance_type = landed_instance_type(desc, pool_list)
+                              put("decider_endpoint_name", endpoint)
+                              put("decider_instance_type", instance_type)
+                              put("decider_device", device)
+                              put("decider_status", "READY")  # last, so READY implies the other parameters are set
+                              log(f"READY: {endpoint} on {instance_type} ({device})")
+                              return 0
+                          log(f"{tier} attempt failed: {reason}")
+                          reasons.append(f"{tier}: {reason}")
+                          if desc is not None:
+                              delete_endpoint(endpoint)
+
+                      put("decider_status", ("FAILED: " + " | ".join(reasons))[:3900])
+                      return 1
+
+
+                  if __name__ == "__main__":
+                      sys.exit(main())
+                  PY
+                      /tmp/venv/bin/python /tmp/deploy_endpoint.py
+                      ;;
+                    *)
+                      echo "Unknown TARGET: $TARGET"
+                      exit 1
+                      ;;
+                  esac
+
+
+  DeciderStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: DeciderOrchestration
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunBuilds
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt DeciderBuildProject.Arn
+              - Sid: SyncIntegration
+                # Required by the codebuild:startBuild.sync integration.
+                Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventForCodeBuildStartBuildRule"
+              - Sid: Status
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/decider_status"
+
+
+  DeciderStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ParentStackName}-decider-provisioner"
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt DeciderStateMachineRole.Arn
+      DefinitionSubstitutions:
+        BuildProject: !Ref DeciderBuildProject
+        StatusParam: /anycompany/agentcore/decider_status
+      Definition:
+        Comment: Builds the Strands Decider artifacts, then creates its endpoint (GPU pools, then CPU pools).
+        QueryLanguage: JSONata
+        StartAt: BuildArtifacts
+        States:
+          BuildArtifacts:
+            Type: Parallel
+            Branches:
+              - StartAt: BuildModelData
+                States:
+                  BuildModelData:
+                    Type: Task
+                    Resource: arn:aws:states:::codebuild:startBuild.sync
+                    Arguments:
+                      ProjectName: ${BuildProject}
+                      EnvironmentVariablesOverride:
+                        - { Name: TARGET, Value: model, Type: PLAINTEXT }
+                    Output: "{% $states.result.Build.BuildStatus %}"
+                    Retry:
+                      - { ErrorEquals: [States.ALL], IntervalSeconds: 60, BackoffRate: 2, MaxAttempts: 2 }
+                    End: true
+              - StartAt: BuildCudaImage
+                States:
+                  BuildCudaImage:
+                    Type: Task
+                    Resource: arn:aws:states:::codebuild:startBuild.sync
+                    Arguments:
+                      ProjectName: ${BuildProject}
+                      EnvironmentVariablesOverride:
+                        - { Name: TARGET, Value: cuda, Type: PLAINTEXT }
+                    Output: "{% $states.result.Build.BuildStatus %}"
+                    Retry:
+                      - { ErrorEquals: [States.ALL], IntervalSeconds: 60, BackoffRate: 2, MaxAttempts: 2 }
+                    End: true
+              - StartAt: BuildCpuImage
+                States:
+                  BuildCpuImage:
+                    Type: Task
+                    Resource: arn:aws:states:::codebuild:startBuild.sync
+                    Arguments:
+                      ProjectName: ${BuildProject}
+                      EnvironmentVariablesOverride:
+                        - { Name: TARGET, Value: cpu, Type: PLAINTEXT }
+                    Output: "{% $states.result.Build.BuildStatus %}"
+                    Retry:
+                      - { ErrorEquals: [States.ALL], IntervalSeconds: 60, BackoffRate: 2, MaxAttempts: 2 }
+                    End: true
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Output: "{% $states.errorOutput %}"
+                Next: MarkFailed
+            Next: DeployEndpoint
+          DeployEndpoint:
+            Type: Task
+            Resource: arn:aws:states:::codebuild:startBuild.sync
+            Arguments:
+              ProjectName: ${BuildProject}
+              ComputeTypeOverride: BUILD_GENERAL1_SMALL
+              PrivilegedModeOverride: false
+              EnvironmentVariablesOverride:
+                - { Name: TARGET, Value: endpoint, Type: PLAINTEXT }
+            Output: "{% $states.result.Build.BuildStatus %}"
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Output: "{% $states.errorOutput %}"
+                Next: ReadStatus
+            Next: Provisioned
+          # The endpoint build records its own FAILED reason; keep it if present.
+          ReadStatus:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Arguments:
+              Name: ${StatusParam}
+            Output: "{% $states.result.Parameter.Value %}"
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Next: MarkFailed
+            Next: StatusRecorded
+          StatusRecorded:
+            Type: Choice
+            Choices:
+              - Condition: "{% $substring($states.input, 0, 6) = 'FAILED' %}"
+                Next: ProvisioningFailed
+            Default: MarkFailed
+          MarkFailed:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:putParameter
+            Arguments:
+              Name: ${StatusParam}
+              Type: String
+              Overwrite: true
+              Value: "{% 'FAILED: ' & $substring($exists($states.input.Cause) ? $string($states.input.Cause) : 'artifact build failed; see the CodeBuild logs', 0, 3800) %}"
+            Retry:
+              - { ErrorEquals: [States.ALL], IntervalSeconds: 5, BackoffRate: 2, MaxAttempts: 3 }
+            Next: ProvisioningFailed
+          ProvisioningFailed:
+            Type: Fail
+            Error: DeciderProvisioningFailed
+            Cause: See /anycompany/agentcore/decider_status and the CodeBuild logs.
+          Provisioned:
+            Type: Succeed
+
+
+  DeciderProvisionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeciderProvisioner
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartAndStop
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:ListExecutions
+                Resource: !Ref DeciderStateMachine
+              - Sid: StopExecutions
+                Effect: Allow
+                Action: states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${DeciderStateMachine.Name}:*"
+              - Sid: StopBuilds
+                Effect: Allow
+                Action:
+                  - codebuild:ListBuildsForProject
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource: !GetAtt DeciderBuildProject.Arn
+              - Sid: CleanUpEndpoint
+                Effect: Allow
+                Action:
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                Resource:
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model/*-decider-*"
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/*-decider-*"
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*-decider-*"
+              - Sid: EmptyModelBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DeciderModelBucket.Arn
+                  - !Sub "${DeciderModelBucket.Arn}/*"
+              - Sid: StatusParams
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/decider_*"
+
+
+  DeciderProvisionerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-decider-provisioner"
+      Description: Starts Strands Decider provisioning on Create; removes the endpoint, models and data on Delete.
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt DeciderProvisionerRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.request
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          OUTPUT_PARAMS = ("decider_status", "decider_endpoint_name", "decider_instance_type", "decider_device")
+
+
+          def _send(event, context, status, data=None, physical=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+
+
+          def _stop_running(p):
+              stopped = 0
+              sfn = boto3.client("stepfunctions")
+              for page in sfn.get_paginator("list_executions").paginate(
+                      stateMachineArn=p["StateMachineArn"], statusFilter="RUNNING"):
+                  for ex in page["executions"]:
+                      sfn.stop_execution(executionArn=ex["executionArn"], cause="Stack deletion")
+                      stopped += 1
+              cb = boto3.client("codebuild")
+              ids = cb.list_builds_for_project(projectName=p["BuildProject"]).get("ids", [])[:100]
+              if ids:
+                  for b in cb.batch_get_builds(ids=ids).get("builds", []):
+                      if b.get("buildStatus") == "IN_PROGRESS":
+                          cb.stop_build(id=b["id"])
+                          stopped += 1
+              return stopped
+
+
+          def _delete_endpoint(sm, name, context):
+              # An endpoint that is still Creating may refuse deletion; retry while time allows.
+              while context.get_remaining_time_in_millis() > 120000:
+                  try:
+                      sm.delete_endpoint(EndpointName=name)
+                      print("deleted endpoint", name)
+                      return
+                  except ClientError as e:
+                      msg = e.response.get("Error", {}).get("Message", "")
+                      if "Could not find" in msg:
+                          return
+                      print("delete endpoint", name, "retrying:", msg)
+                      time.sleep(20)
+              print("WARNING: could not delete endpoint", name, "- delete it manually")
+
+
+          def _cleanup(p, context):
+              prefix = p["NamePrefix"]
+              try:
+                  if _stop_running(p):
+                      time.sleep(20)  # let stopped builds release the bucket
+              except Exception as e:
+                  print("stop running work:", e)
+              sm = boto3.client("sagemaker")
+              for tier in ("gpu", "cpu"):
+                  _delete_endpoint(sm, f"{prefix}-{tier}", context)
+              for call, kw in [("delete_endpoint_config", {"EndpointConfigName": f"{prefix}-gpu-config"}),
+                               ("delete_endpoint_config", {"EndpointConfigName": f"{prefix}-cpu-config"}),
+                               ("delete_model", {"ModelName": f"{prefix}-cuda-model"}),
+                               ("delete_model", {"ModelName": f"{prefix}-cpu-model"})]:
+                  try:
+                      getattr(sm, call)(**kw)
+                  except ClientError as e:
+                      print(call, kw, e.response.get("Error", {}).get("Message", ""))
+              s3 = boto3.client("s3")
+              try:
+                  for page in s3.get_paginator("list_objects_v2").paginate(Bucket=p["BucketName"]):
+                      keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                      for i in range(0, len(keys), 1000):
+                          s3.delete_objects(Bucket=p["BucketName"], Delete={"Objects": keys[i:i + 1000], "Quiet": True})
+              except ClientError as e:
+                  print("empty bucket:", e)
+              try:
+                  boto3.client("ssm").delete_parameters(Names=[f"{p['SsmPrefix']}/{n}" for n in OUTPUT_PARAMS])
+              except ClientError as e:
+                  print("delete ssm:", e)
+
+
+          def handler(event, context):
+              rt = event.get("RequestType")
+              p = event.get("ResourceProperties", {})
+              physical = event.get("PhysicalResourceId") or (p.get("NamePrefix", "decider") + "-provisioner")
+              try:
+                  if rt == "Create":
+                      boto3.client("ssm").put_parameter(Name=f"{p['SsmPrefix']}/decider_status", Value="PROVISIONING",
+                                                        Type="String", Overwrite=True)
+                      arn = boto3.client("stepfunctions").start_execution(
+                          stateMachineArn=p["StateMachineArn"], name=f"provision-{int(time.time())}")["executionArn"]
+                      print("started", arn)
+                      _send(event, context, SUCCESS, {"ExecutionArn": arn}, physical)
+                  elif rt == "Update":
+                      # Provisioning runs once per Create. To redeploy, set DeployDecider to false, update, then true.
+                      _send(event, context, SUCCESS, {}, physical)
+                  else:
+                      _cleanup(p, context)
+                      _send(event, context, SUCCESS, {}, physical)
+              except Exception as e:
+                  print("ERROR:", e)
+                  # Never block stack deletion on cleanup errors; they are logged above.
+                  _send(event, context, SUCCESS if rt == "Delete" else FAILED, {"Error": str(e)[:900]}, physical)
+
+
+  # Returns as soon as provisioning starts, so stack creation does not wait for the endpoint.
+  # Delete runs before the bucket, repository and roles are removed (it references them).
+  DeciderProvisioner:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DeciderProvisionerFunction.Arn
+      ServiceTimeout: 900
+      StateMachineArn: !Ref DeciderStateMachine
+      BuildProject: !Ref DeciderBuildProject
+      BucketName: !Ref DeciderModelBucket
+      ImageRepository: !Ref DeciderImageRepository
+      EndpointRoleArn: !GetAtt DeciderEndpointRole.Arn
+      NamePrefix: !Sub "${ParentStackName}-decider"
+      SsmPrefix: /anycompany/agentcore
+
+
+  SsmDeciderStateMachineArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/decider_state_machine_arn
+      Type: String
+      Value: !Ref DeciderStateMachine
+
+Outputs:
+
+  DeciderStateMachineArn:
+    Description: Step Functions state machine that provisions the Strands Decider endpoint
+    Value: !Ref DeciderStateMachine
+  DeciderModelBucketName:
+    Description: Private S3 bucket holding the Strands Decider model weights
+    Value: !Ref DeciderModelBucket
+  DeciderImageRepositoryUri:
+    Description: ECR repository holding the Strands Decider cuda and cpu images
+    Value: !GetAtt DeciderImageRepository.RepositoryUri
