@@ -46,7 +46,7 @@ PROVIDER_LABELS = {"perplexity": "Perplexity Decisions", "strands": "Strands Dec
 KB_LABELS = {"bedrock": "Amazon Bedrock Knowledge Bases", "couchbase": "Couchbase Capella"}
 WEBSEARCH_LABELS = {"agentcore": "AgentCore Web Search", "brave": "Brave Search",
                     "perplexity": "Perplexity Search"}
-OBSERVABILITY_LABELS = {"cloudwatch": "Amazon CloudWatch", "datadog": "Datadog"}
+OBSERVABILITY_LABELS = {"cloudwatch": "Amazon CloudWatch", "datadog": "Datadog", "cloudzero": "CloudZero"}
 MODEL_PROVIDER_LABELS = {"bedrock": "Amazon Bedrock", "baseten": "Baseten"}
 
 @st.cache_resource
