@@ -1,0 +1,1372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  L3 Orchestration — Cognito user pool and test users, AgentCore gateways, Agent Registry, Application Signals discovery, and SSM handoffs.
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in physical resource names so they stay
+      the same as in the single-stack template (a nested stack's own name is auto-generated).
+
+Resources:
+
+
+  # ===========================================================================
+  # L3 Orchestration pre-provisioning (added on top of the data layer)
+  # ===========================================================================
+  AgentUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: AnyCompanyAgentPool
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true   # workshop uses admin-created users only (no self sign-up); clears AppSec finding
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: customer_id
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "1"
+            MaxLength: "50"
+        - Name: tier
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: "1"
+            MaxLength: "20"
+
+
+  AgentUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: AnyCompanyChatbot
+      UserPoolId: !Ref AgentUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+
+  # --- Gateway execution role (invokes the order/refund/registry tool Lambdas) ---
+  GatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AnyCompanyAgentCoreGatewayRole
+      Description: Execution role for AnyCompany AgentCore Gateway
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AnyCompanyGatewayPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeLambdaTargets
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:anycompany_order_tools"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:anycompany_refund_tools"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ParentStackName}-agent-invoker"
+                  # L4 PII interceptor (created in the l4-security notebook Step 4). Name must stay
+                  # in sync with INTERCEPTOR_LAMBDA_NAME there and the log-group scope in l4-security.yaml.
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:anycompany-pii-interceptor"
+              - Sid: RegistryDiscovery
+                Effect: Allow
+                Action:
+                  - agent-registry:InvokeRegistryMcp
+                  - agent-registry:SearchDiscoverableRegistryRecords
+                  - agent-registry:ListDiscoverableRegistryRecords
+                  - agent-registry:BatchGetDiscoverableRegistryRecord
+                Resource: !Sub "arn:aws:agent-registry:${AWS::Region}:${AWS::AccountId}:*"
+              # --- Web-search tools for the Research Agent (connected in 1_gateway_tools.ipynb) ---
+              # Pre-granted here so the notebook never edits this stack-owned role.
+              # Only the provider the participant connects is ever used. The Research
+              # Agent role and the Brave MCP server itself are in l3-websearch.yaml.
+              #
+              # AgentCore Web Search connector (target connectorId "web-search").
+              # The working resource ARN includes the region (per the AWS sample).
+              - Sid: WebSearchConnector
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeWebSearch
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1"
+              # Brave Search MCP server, hosted on an AgentCore Runtime named brave_mcp_server.
+              - Sid: InvokeBraveMcpRuntime
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/brave_mcp_server-*"
+              # Perplexity hosted MCP: the Gateway fetches the key from an AgentCore
+              # API-key credential provider (stored in the AgentCore token vault).
+              - Sid: ApiKeyOutboundWorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetResourceApiKey
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/*"
+              - Sid: ApiKeyOutboundSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/apikey/*"
+
+
+  # --- Cognito-JWT gateway used by the sub-agents ---
+  AgentGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: anycompany-agent-gateway
+      Description: AnyCompany agent gateway - routes requests to specialist agents via the registry.
+      RoleArn: !GetAtt GatewayExecutionRole.Arn
+      ProtocolType: MCP
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${AgentUserPool}/.well-known/openid-configuration"
+          AllowedAudience:
+            - !Ref AgentUserPoolClient
+
+
+  # --- IAM-auth gateway used by the Harness (registry discovery tools) ---
+  HarnessGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: anycompany-harness-gateway
+      Description: IAM-auth gateway for the Harness to access registry discovery tools
+      RoleArn: !GetAtt GatewayExecutionRole.Arn
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+
+  # Registry Discovery tool - native gateway target pointing at the registry's own
+  # MCP endpoint (search/list/get only; it cannot invoke agents, see AgentInvokerTarget).
+  # Replaces the former notebook-created Lambda + gateway target's search half; no Lambda
+  # or SDK layer is needed. The endpoint URL is the documented
+  # pattern (agent-registry.<region>.api.aws/registry/<id>/mcp), built from the
+  # native registry's id, and is reached with IAM (SigV4 for service "agent-registry").
+  RegistryDiscoveryTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt HarnessGateway.GatewayIdentifier
+      Name: registry-discovery
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+          CredentialProvider:
+            IamCredentialProvider:
+              Service: agent-registry
+              Region: !Ref AWS::Region
+      TargetConfiguration:
+        Mcp:
+          McpServer:
+            Endpoint: !Sub "https://agent-registry.${AWS::Region}.api.aws/registry/${RegistryResource.RegistryId}/mcp"
+            ListingMode: DYNAMIC
+
+  # Agent Invoker tool - the "invoke" half the registry endpoint lacks. The Harness
+  # finds an agent with registry-discovery, then calls agent-invoker___invoke_agent with
+  # the agent's runtime ARN (or its A2A agent-card url) and a message. The Lambda sends
+  # one A2A message/send to that runtime, signed with its own IAM role, and returns the
+  # reply text. It only accepts runtime ARNs in this account and region.
+  AgentInvokerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AnyCompanyAgentInvokerLambdaRole
+      Description: Execution role for the Harness agent-invoker gateway tool
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentInvokerPerms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ParentStackName}-agent-invoker"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ParentStackName}-agent-invoker:*"
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+
+  AgentInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-agent-invoker"
+      Description: Harness gateway tool - sends an A2A message to a registered agent runtime
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt AgentInvokerLambdaRole.Arn
+      # The Research Agent runs web searches plus an LLM turn, which can take longer
+      # than an order/refund lookup; 120s leaves room for it (urlopen below is 115s).
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          ACCOUNT_ID: !Ref AWS::AccountId
+      Code:
+        ZipFile: |
+          import json, os, re, uuid, urllib.error, urllib.parse, urllib.request
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          REGION = os.environ["AWS_REGION"]
+          ARN_RE = re.compile(r"^arn:aws:bedrock-agentcore:%s:%s:runtime/[A-Za-z0-9_-]+$"
+                              % (re.escape(REGION), re.escape(os.environ["ACCOUNT_ID"])))
+          # W3C traceparent: 00-<32 hex trace id>-<16 hex span id>-<2 hex flags>.
+          TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+          SESSION = boto3.Session()
+
+          def _runtime_arn(value):
+              value = (value or "").strip()
+              if "/runtimes/" in value:  # A2A agent-card url -> runtime ARN
+                  value = urllib.parse.unquote(value.split("/runtimes/")[1].split("/invocations")[0])
+              return value if ARN_RE.match(value) else None
+
+          def _propagated_headers(event, context):
+              """Best-effort pull of the request headers the Gateway forwarded to this
+              Lambda target. The AgentCore Gateway surfaces allowlisted request headers
+              as `bedrockAgentCorePropagatedHeaders` (on the Lambda client_context, and
+              some paths on the event). Keys are lower-cased. Never raises; returns {}."""
+              out = {}
+              try:
+                  custom = getattr(getattr(context, "client_context", None), "custom", None)
+                  if isinstance(custom, dict):
+                      ph = custom.get("bedrockAgentCorePropagatedHeaders")
+                      if isinstance(ph, dict):
+                          out.update(ph)
+              except Exception:
+                  pass
+              try:
+                  for key in ("bedrockAgentCorePropagatedHeaders", "headers"):
+                      ph = event.get(key)
+                      if isinstance(ph, dict):
+                          out.update(ph)
+              except Exception:
+                  pass
+              return {k.lower(): v for k, v in out.items() if isinstance(k, str)}
+
+          def _session_id_from_baggage(baggage):
+              """Extract session.id from a W3C `baggage` header (comma-separated
+              key=value list). AgentCore forwards the managed Harness's baggage,
+              which carries `session.id=<runtime session id>` -- the stable
+              per-conversation id. Returns '' if absent/malformed. Never raises."""
+              try:
+                  for item in (baggage or "").split(","):
+                      k, _, v = item.partition("=")
+                      if k.strip() == "session.id":
+                          return urllib.parse.unquote(v.strip())
+              except Exception:
+                  pass
+              return ""
+
+          def handler(event, context):
+              arn = _runtime_arn(event.get("agent_runtime_arn"))
+              message = (event.get("message") or "").strip()
+              if not arn or not message:
+                  return {"status": "error", "message": "agent_runtime_arn (a runtime ARN in this account, "
+                          "or the url from the agent card) and message are required"}
+              url = ("https://bedrock-agentcore.%s.amazonaws.com/runtimes/%s/invocations?qualifier=DEFAULT"
+                     % (REGION, urllib.parse.quote(arn, safe="")))
+              a2a_message = {"messageId": str(uuid.uuid4()), "role": "user",
+                             "parts": [{"kind": "text", "text": message}]}
+              # Resolve the conversation/grouping id DETERMINISTICALLY. AgentCore
+              # forwards the managed Harness's W3C `baggage` header (allowlisted on
+              # this target), which carries `session.id=<runtime session id>` -- the
+              # stable per-conversation id. Prefer it so specialist session grouping
+              # never depends on the orchestrator LLM echoing the id into the
+              # session_id tool arg (that echo is unreliable and is what caused the
+              # phantom "No content" sessions). Fall back to the LLM-passed
+              # session_id. Carried in the A2A body (NOT the runtime session header,
+              # which stays a fresh uuid4 per call so each invocation gets its own
+              # microVM) so the specialist stamps the same gen_ai.conversation.id.
+              _ph = _propagated_headers(event, context)
+              session_id = _session_id_from_baggage(_ph.get("baggage")) or (event.get("session_id") or "").strip()
+              if session_id:
+                  a2a_message["metadata"] = {"conversationId": session_id}
+              # Trace-context propagation (Datadog OTEL-direct path). Read any W3C
+              # traceparent the managed Harness injected and the Gateway forwarded
+              # (allowlisted on this target via MetadataConfiguration above), LOG it
+              # (the probe that confirms the Harness injects + the Gateway forwards),
+              # then, if well-formed, re-inject it into the downstream A2A BODY
+              # metadata (NOT an HTTP header -- the Runtime does not forward arbitrary
+              # inbound headers to the container; the body is the proven carrier, same
+              # as conversationId). Fully fail-soft: absent/garbled traceparent leaves
+              # the body byte-identical to today and never errors -- session grouping
+              # via conversationId stays the fallback.
+              try:
+                  traceparent = str(_ph.get("traceparent") or "").strip()
+                  tracestate = str(_ph.get("tracestate") or "").strip()
+                  print(json.dumps({"event": "trace_propagation_probe",
+                                    "traceparent_present": bool(traceparent),
+                                    "traceparent": traceparent,
+                                    "tracestate_present": bool(tracestate)}))
+                  if traceparent and TRACEPARENT_RE.match(traceparent):
+                      meta = a2a_message.setdefault("metadata", {})
+                      meta["traceparent"] = traceparent
+                      if tracestate:
+                          meta["tracestate"] = tracestate
+              except Exception:
+                  pass
+              body = json.dumps({"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": "message/send",
+                                 "params": {"message": a2a_message}})
+              req = AWSRequest(method="POST", url=url, data=body, headers={
+                  "Content-Type": "application/json",
+                  "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": str(uuid.uuid4())})
+              SigV4Auth(SESSION.get_credentials().get_frozen_credentials(), "bedrock-agentcore", REGION).add_auth(req)
+              try:
+                  # URL is https and built from a validated runtime ARN in this account.
+                  with urllib.request.urlopen(urllib.request.Request(  # nosec B310
+                          url, data=body.encode(), headers=dict(req.headers), method="POST"), timeout=115) as r:
+                      raw = r.read().decode("utf-8")
+              except urllib.error.HTTPError as e:
+                  return {"status": "error", "message": "HTTP %s: %s" % (e.code, e.read().decode("utf-8")[:500])}
+              except Exception as e:
+                  return {"status": "error", "message": str(e)[:500]}
+              try:
+                  result = json.loads(raw).get("result", {})
+                  texts = [p.get("text", "") for a in result.get("artifacts", [])
+                           for p in a.get("parts", []) if p.get("kind") == "text"]
+                  if texts:
+                      return {"status": "success", "response": "\n".join(texts)}
+              except (ValueError, AttributeError):
+                  pass
+              return {"status": "success", "response": raw[:4000] or "Agent returned an empty response"}
+
+  AgentInvokerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentInvokerFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt HarnessGateway.GatewayArn
+
+  AgentInvokerTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: AgentInvokerPermission
+    Properties:
+      GatewayIdentifier: !GetAtt HarnessGateway.GatewayIdentifier
+      Name: agent-invoker
+      Description: Invoke a specialist agent found in the Agent Registry (A2A message/send)
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      # Allowlist the W3C trace-context headers so the managed Harness's injected
+      # traceparent/tracestate (plus baggage) are forwarded from the inbound MCP
+      # tools/call to this Lambda target. The Gateway forwards NO request headers
+      # unless explicitly allowlisted here. The Lambda handler re-injects the
+      # traceparent into the downstream A2A body so the specialist can adopt the
+      # remote parent span (Harness -> specialist trace linking, Datadog mode).
+      # Limits (per the AgentCore Gateway header-propagation doc): <=10 request
+      # headers, each matching ^[a-zA-Z0-9_-]+$; the W3C trace headers are NOT on
+      # the Gateway restricted-header list, so they can be allowlisted.
+      MetadataConfiguration:
+        AllowedRequestHeaders:
+          - traceparent
+          - tracestate
+          - baggage
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt AgentInvokerFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: invoke_agent
+                  Description: >-
+                    Send a message to a specialist agent found in the Agent Registry and return its reply.
+                    Pass the agent's runtime ARN, or the 'url' from its A2A agent card
+                    (descriptors.a2aAgentCard.data in the registry record).
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      agent_runtime_arn:
+                        Type: string
+                        Description: The agent's runtime ARN, or the url from its A2A agent card
+                      message:
+                        Type: string
+                        Description: The request to send to the specialist agent, including the authenticated customer_id
+                      session_id:
+                        Type: string
+                        Description: >-
+                          Optional conversation/grouping id from the incoming message. Pass it on
+                          every call so the specialist's observability spans group into one session.
+                    Required:
+                      - agent_runtime_arn
+                      - message
+
+  # --- SSM handoffs (same keys the L3/L5 notebooks read) ---
+  OrchestrationCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrchestrationCustomResourcePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Used by TestUsersCustomResourceFunction; scoped to the workshop user pool.
+              - Sid: CognitoAdmin
+                Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminDeleteUser
+                Resource: !GetAtt AgentUserPool.Arn
+              - Sid: SsmWrite
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/*"
+              # Used by AppSignalsDiscoveryFunction. StartDiscovery has no resource
+              # types, so it requires Resource: '*'.
+              - Sid: AppSignalsDiscovery
+                Effect: Allow
+                Action:
+                  - application-signals:StartDiscovery
+                Resource: "*"
+
+
+  # Agent Registry — native CloudFormation resource type (AWS::AgentRegistry::Registry).
+  # Replaces the former custom-resource Lambda + vendored agent-registry-control SDK layer.
+  RegistryResource:
+    Type: AWS::AgentRegistry::Registry
+    Properties:
+      Name: anycompany-agent-registry
+      Description: AnyCompany agent registry - centralized catalog for order, refund, and vision agents.
+      ApprovalConfiguration:
+        AutoApprovalRules:
+          - APPROVE_ALL
+
+
+  TestUsersCustomResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-testusers-cr"
+      Description: CloudFormation custom resource that creates the AnyCompany Cognito test users with permanent passwords.
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt OrchestrationCustomResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, secrets, string
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          def _send(event, context, status, data=None, physical=None):
+              import json, urllib.request
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+
+          SSM_PW = "/anycompany/agentcore/user_password"
+          USERS = [
+              ("gold_customer",   "gold@example.com",   "CUST-789", "gold"),
+              ("silver_customer", "silver@example.com", "CUST-456", "silver"),
+              ("bronze_customer", "bronze@example.com", "CUST-123", "bronze"),
+          ]
+
+          def _gen(n=16):
+              u = secrets.choice(string.ascii_uppercase)
+              l = secrets.choice(string.ascii_lowercase)
+              d = secrets.choice(string.digits)
+              s = secrets.choice("!@#$%^&*")
+              rest = [secrets.choice(string.ascii_letters + string.digits + "!@#$%^&*") for _ in range(n - 4)]
+              pool = [u, l, d, s] + rest
+              secrets.SystemRandom().shuffle(pool)
+              return "".join(pool)
+
+          def handler(event, context):
+              rt = event.get("RequestType")
+              props = event.get("ResourceProperties", {})
+              pool_id = props.get("UserPoolId")
+              region = props.get("Region")
+              cog = boto3.client("cognito-idp", region_name=region) if region else boto3.client("cognito-idp")
+              ssm = boto3.client("ssm", region_name=region) if region else boto3.client("ssm")
+              try:
+                  if rt == "Delete":
+                      # Users are removed when the pool is deleted; just clean up the SSM secret.
+                      try: ssm.delete_parameter(Name=SSM_PW)
+                      except Exception as e: print("ssm delete:", e)
+                      _send(event, context, SUCCESS, {})
+                      return
+
+                  # Reuse the existing password on update/re-run; otherwise generate one.
+                  try:
+                      pw = ssm.get_parameter(Name=SSM_PW, WithDecryption=True)["Parameter"]["Value"]
+                  except ssm.exceptions.ParameterNotFound:
+                      pw = _gen()
+
+                  for username, email, cid, tier in USERS:
+                      try:
+                          cog.admin_create_user(
+                              UserPoolId=pool_id,
+                              Username=username,
+                              UserAttributes=[
+                                  {"Name": "email", "Value": email},
+                                  {"Name": "email_verified", "Value": "true"},
+                                  {"Name": "custom:customer_id", "Value": cid},
+                                  {"Name": "custom:tier", "Value": tier},
+                              ],
+                              MessageAction="SUPPRESS",
+                          )
+                      except cog.exceptions.UsernameExistsException:
+                          print("exists:", username)
+                      cog.admin_set_user_password(
+                          UserPoolId=pool_id, Username=username, Password=pw, Permanent=True,
+                      )
+
+                  ssm.put_parameter(Name=SSM_PW, Value=pw, Type="SecureString", Overwrite=True)
+                  _send(event, context, SUCCESS,
+                      {"Users": ",".join(u[0] for u in USERS)},
+                      physical=f"{pool_id}-testusers")
+              except Exception as e:
+                  print("ERROR:", e)
+                  _send(event, context, FAILED, {"Error": str(e)[:900]})
+
+
+  TestUsersResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: AgentUserPoolClient
+    Properties:
+      ServiceToken: !GetAtt TestUsersCustomResourceFunction.Arn
+      ServiceTimeout: 300
+      UserPoolId: !Ref AgentUserPool
+      Region: !Ref AWS::Region
+
+
+  AppSignalsDiscoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-appsignals-discovery"
+      Description: Enables CloudWatch Application Signals discovery (matches notebook Step 1).
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt OrchestrationCustomResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          def _send(event, context, status, data=None, physical=None):
+              import json, urllib.request
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+
+          def handler(event, context):
+              try:
+                  if event.get("RequestType") != "Delete":
+                      region = event.get("ResourceProperties", {}).get("Region")
+                      cw = boto3.client("application-signals", region_name=region) if region \
+                          else boto3.client("application-signals")
+                      cw.start_discovery()
+                      print("Application Signals discovery started")
+                  _send(event, context, SUCCESS, {})
+              except Exception as e:
+                  # Best-effort (idempotent): don't fail the stack if already enabled.
+                  print("WARN:", e)
+                  _send(event, context, SUCCESS, {"Warning": str(e)[:900]})
+
+
+  AppSignalsDiscoveryResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AppSignalsDiscoveryFunction.Arn
+      ServiceTimeout: 120
+      Region: !Ref AWS::Region
+
+
+  # ===========================================================================
+  # L3 Orchestration pre-provisioning (common across all variants, not swapped)
+  # Mirrors aws-reinvent/workshop/l3-orchestration/1_gateway_tools.ipynb so
+  # participants skip the deterministic setup. Writes the same
+  # /anycompany/agentcore/* SSM params the notebooks read at runtime.
+  # ===========================================================================
+
+  # --- Cognito user pool + app client (custom customer_id / tier claims) ---
+  SsmRegion:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/region
+      Type: String
+      Value: !Ref AWS::Region
+
+  SsmAccountId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/account_id
+      Type: String
+      Value: !Ref AWS::AccountId
+
+  SsmGatewayId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/gateway_id
+      Type: String
+      Value: !GetAtt AgentGateway.GatewayIdentifier
+
+  SsmGatewayArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/gateway_arn
+      Type: String
+      Value: !GetAtt AgentGateway.GatewayArn
+
+  SsmGatewayUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/gateway_url
+      Type: String
+      Value: !GetAtt AgentGateway.GatewayUrl
+
+  SsmGatewayName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/gateway_name
+      Type: String
+      Value: anycompany-agent-gateway
+
+  SsmGatewayRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/gateway_role_arn
+      Type: String
+      Value: !GetAtt GatewayExecutionRole.Arn
+
+  SsmHarnessGatewayArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/harness_gateway_arn
+      Type: String
+      Value: !GetAtt HarnessGateway.GatewayArn
+
+  SsmCognitoUserPoolId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/cognito_user_pool_id
+      Type: String
+      Value: !Ref AgentUserPool
+
+  SsmCognitoClientId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/cognito_client_id
+      Type: String
+      Value: !Ref AgentUserPoolClient
+
+  SsmRegistryName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/registry_name
+      Type: String
+      Value: anycompany-agent-registry
+
+
+  # --- Agent Registry (native AWS::AgentRegistry::Registry) ---
+  # Shared execution role for the orchestration custom-resource Lambdas
+  # (Agent Registry + Cognito test users).
+  SsmRegistryId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/registry_id
+      Type: String
+      Value: !GetAtt RegistryResource.RegistryId
+
+  SsmRegistryArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/registry_arn
+      Type: String
+      Value: !GetAtt RegistryResource.RegistryArn
+
+  # --- Execution roles for the L3 tool Lambdas ---
+  # 1_gateway_tools.ipynb deploys the anycompany_order_tools / anycompany_refund_tools
+  # Lambdas with these roles. Names and permissions match what the notebook used to
+  # create, so the Lambdas, their log groups and the agent notebooks are unaffected.
+  OrderToolsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AnyCompanyOrderToolsLambdaRole
+      Description: Execution role for the anycompany_order_tools Lambda (L3 order lookup tool).
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrderToolsPerms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/anycompany_order_tools"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/anycompany_order_tools:*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub "arn:aws:dynamodb:*:${AWS::AccountId}:table/CustomerOrders"
+                  - !Sub "arn:aws:dynamodb:*:${AWS::AccountId}:table/CustomerOrders/index/*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:*:parameter/anycompany/agentcore/*"
+
+  RefundToolsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AnyCompanyRefundToolsLambdaRole
+      Description: Execution role for the anycompany_refund_tools Lambda (L3 refund tools).
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Lets the function run in the Couchbase egress subnet (creates its network
+      # interfaces). Unused when the Refund tool reads the Bedrock Knowledge Base.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: RefundToolsPerms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/anycompany_refund_tools"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/anycompany_refund_tools:*"
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !Sub "arn:aws:bedrock:*:${AWS::AccountId}:knowledge-base/*"
+              # Couchbase knowledge base (L1 Couchbase option): embed the question with
+              # Titan and read the Capella connection details saved by L1.
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/couchbase/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub "arn:aws:dynamodb:*:${AWS::AccountId}:table/CustomerOrders"
+                  - !Sub "arn:aws:dynamodb:*:${AWS::AccountId}:table/CustomerOrders/index/*"
+
+  SsmOrderToolsRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/order_tools_role_arn
+      Type: String
+      Value: !GetAtt OrderToolsLambdaRole.Arn
+
+  SsmRefundToolsRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/refund_tools_role_arn
+      Type: String
+      Value: !GetAtt RefundToolsLambdaRole.Arn
+
+  # --- Execution roles for the Order / Refund A2A agent runtimes ---
+  # 2_specialist_agents.ipynb launches the Order and Refund runtimes with these roles.
+  # Names and permissions match what the notebooks used to create. Based on
+  # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html
+  OrderAgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentCoreOrderAgentA2ARole
+      Description: Runtime role for Order A2A Agent
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrderAgentRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInference
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - "arn:aws:bedrock:*:*:inference-profile/*"
+              # ecr:GetAuthorizationToken has no resource-level permissions, so AWS
+              # requires Resource: '*'. Image pulls below are scoped to bedrock-agentcore-* repos.
+              - Sid: ECRAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRAgentImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: "arn:aws:ecr:*:*:repository/bedrock-agentcore-*"
+              # X-Ray tracing requires Resource: '*'
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              # PutMetricData requires Resource: '*'; the namespace condition scopes it.
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: CloudWatchLogsGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: CloudWatchLogsDescribeGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:*"
+              - Sid: AgentCoreWorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+              - Sid: SSMConfig
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: "arn:aws:ssm:*:*:parameter/anycompany/agentcore/*"
+
+  RefundAgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentCoreRefundAgentA2ARole
+      Description: Runtime role for Refund A2A Agent
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RefundAgentRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInference
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - "arn:aws:bedrock:*:*:inference-profile/*"
+              # ecr:GetAuthorizationToken has no resource-level permissions, so AWS
+              # requires Resource: '*'. Image pulls below are scoped to bedrock-agentcore-* repos.
+              - Sid: ECRAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRAgentImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: "arn:aws:ecr:*:*:repository/bedrock-agentcore-*"
+              # X-Ray tracing requires Resource: '*'
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              # PutMetricData requires Resource: '*'; the namespace condition scopes it.
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: CloudWatchLogsGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: CloudWatchLogsDescribeGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:*"
+              - Sid: AgentCoreWorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+              - Sid: SSMConfig
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: "arn:aws:ssm:*:*:parameter/anycompany/agentcore/*"
+
+  SsmOrderAgentRuntimeRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/order_agent_runtime_role_arn
+      Type: String
+      Value: !GetAtt OrderAgentRuntimeRole.Arn
+
+  SsmRefundAgentRuntimeRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/refund_agent_runtime_role_arn
+      Type: String
+      Value: !GetAtt RefundAgentRuntimeRole.Arn
+
+  # --- Execution role for the orchestrator Harness (and its AgentCore Memory) ---
+  # 3_orchestrator_agent.ipynb creates the Harness and Memory with this role. Name and
+  # permissions match what the notebook used to create.
+  HarnessExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AnyCompanyAgentCoreHarnessRole
+      Description: Execution role for AnyCompany AgentCore Harness
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock-agentcore.amazonaws.com
+                - bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AnyCompanyHarnessPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - "arn:aws:bedrock:*:*:inference-profile/*"
+              # X-Ray tracing requires Resource: '*' — traces are not resource-specific.
+              - Sid: XRayTracingAccess
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              # PutMetricData requires Resource: '*'; the namespace condition scopes it.
+              - Sid: CloudWatchMetricsPublish
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              # Wildcard required for dynamic runtime log groups under /aws/bedrock-agentcore/runtimes/.
+              - Sid: CloudWatchLogsGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: CloudWatchLogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+              - Sid: CloudWatchLogsDescribeGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              # Wildcard required for harness workload identities — scoped to the harness_* prefix.
+              - Sid: AgentCoreWorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/harness_*"
+              - Sid: AgentCoreBrowserDefault
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartBrowserSession
+                  - bedrock-agentcore:StopBrowserSession
+                  - bedrock-agentcore:GetBrowserSession
+                  - bedrock-agentcore:ListBrowserSessions
+                  - bedrock-agentcore:UpdateBrowserStream
+                  - bedrock-agentcore:ConnectBrowserAutomationStream
+                  - bedrock-agentcore:ConnectBrowserLiveViewStream
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:browser/*"
+              - Sid: AgentCoreCodeInterpreterDefault
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartCodeInterpreterSession
+                  - bedrock-agentcore:StopCodeInterpreterSession
+                  - bedrock-agentcore:GetCodeInterpreterSession
+                  - bedrock-agentcore:ListCodeInterpreterSessions
+                  - bedrock-agentcore:InvokeCodeInterpreter
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/*"
+              - Sid: AgentCoreMemory
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*"
+              - Sid: AgentCoreInvokeRuntime
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+              - Sid: AgentCoreRegistry
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:SearchRegistryRecords
+                  - bedrock-agentcore:GetRegistryRecord
+                  - bedrock-agentcore:ListRegistryRecords
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+              - Sid: AgentCoreGatewayAccess
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+              # A Bedrock orchestrator model uses BedrockModelInvocation above. A partner
+              # model (Baseten) runs through liteLlmModelConfig and
+              # authenticates with an API key that 3_orchestrator_agent.ipynb stores in the
+              # AgentCore Identity credential provider "anycompany-orchestrator-model-key".
+              # These statements let the Harness read THAT key only, per
+              # https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html
+              - Sid: AgentCoreApiKeyTokenVaultDefault
+                Effect: Allow
+                Action: bedrock-agentcore:GetResourceApiKey
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/harness_anycompany_orchestrator-*"
+              - Sid: AgentCoreApiKeyTokenVaultPerKey
+                Effect: Allow
+                Action: bedrock-agentcore:GetResourceApiKey
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/apikeycredentialprovider/anycompany-orchestrator-model-key"
+              - Sid: AgentCoreApiKeySecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/apikey/anycompany-orchestrator-model-key-*"
+
+  SsmHarnessRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/harness_role_arn
+      Type: String
+      Value: !GetAtt HarnessExecutionRole.Arn
+
+  # ===========================================================================
+  # Couchbase egress: a fixed outbound IP for the Refund tools Lambda.
+  # When the participant picks Couchbase in L1, the Refund Lambda runs in this
+  # private subnet and reaches Capella through the NAT gateway's Elastic IP,
+  # which L1 adds to the Capella allowlist (one /32, never 0.0.0.0/0).
+  # Built in the account's default VPC; the Bedrock KB path does not use it.
+  # ===========================================================================
+  CouchbaseEgressLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribeDefaultVpc
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: "*"   # Describe* actions do not support resource-level permissions
+  CouchbaseEgressLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Return the default VPC, its CIDR, and one public default subnet (Couchbase egress)
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      Role: !GetAtt CouchbaseEgressLookupRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          def _send(event, context, status, data=None, reason=None):
+              body = json.dumps({
+                  "Status": status, "Reason": reason or context.log_stream_name,
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or "couchbase-egress-lookup",
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+          def lambda_handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      return _send(event, context, "SUCCESS")
+                  ec2 = boto3.client("ec2")
+                  vpc = ec2.describe_vpcs(Filters=[{"Name": "is-default", "Values": ["true"]}])["Vpcs"][0]
+                  subnets = ec2.describe_subnets(Filters=[
+                      {"Name": "vpc-id", "Values": [vpc["VpcId"]]},
+                      {"Name": "default-for-az", "Values": ["true"]}])["Subnets"]
+                  public = sorted(subnets, key=lambda s: s["AvailabilityZone"])[0]
+                  _send(event, context, "SUCCESS", {
+                      "VpcId": vpc["VpcId"], "VpcCidr": vpc["CidrBlock"],
+                      "PublicSubnetId": public["SubnetId"], "AvailabilityZone": public["AvailabilityZone"]})
+              except Exception as e:
+                  _send(event, context, "FAILED", reason=f"Default VPC lookup failed: {e}")
+  CouchbaseEgressLookup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CouchbaseEgressLookupFunction.Arn
+      ServiceTimeout: 300
+  CouchbaseEgressSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !GetAtt CouchbaseEgressLookup.VpcId
+      AvailabilityZone: !GetAtt CouchbaseEgressLookup.AvailabilityZone
+      # The last /24 of the default VPC (172.31.255.0/24); default subnets use the low /20s.
+      CidrBlock: !Select [255, !Cidr [!GetAtt CouchbaseEgressLookup.VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: anycompany-couchbase-egress
+  CouchbaseEgressEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: anycompany-couchbase-egress
+  CouchbaseEgressNat:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !GetAtt CouchbaseEgressLookup.PublicSubnetId
+      AllocationId: !GetAtt CouchbaseEgressEip.AllocationId
+      Tags:
+        - Key: Name
+          Value: anycompany-couchbase-egress
+  CouchbaseEgressRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !GetAtt CouchbaseEgressLookup.VpcId
+      Tags:
+        - Key: Name
+          Value: anycompany-couchbase-egress
+  CouchbaseEgressRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref CouchbaseEgressRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref CouchbaseEgressNat
+  CouchbaseEgressRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref CouchbaseEgressSubnet
+      RouteTableId: !Ref CouchbaseEgressRouteTable
+  CouchbaseEgressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Refund tools Lambda (Couchbase option) - outbound only, no inbound rules
+      VpcId: !GetAtt CouchbaseEgressLookup.VpcId
+      SecurityGroupEgress:
+        # Outbound only, through the NAT gateway: AWS APIs (SSM, Bedrock) and Capella.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS APIs and Capella
+        - IpProtocol: tcp
+          FromPort: 11207
+          ToPort: 11207
+          CidrIp: 0.0.0.0/0
+          Description: Couchbase data service (TLS)
+        - IpProtocol: tcp
+          FromPort: 18091
+          ToPort: 18096
+          CidrIp: 0.0.0.0/0
+          Description: Couchbase management, query and search services (TLS)
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS (SRV lookup of the Capella connection string)
+      Tags:
+        - Key: Name
+          Value: anycompany-couchbase-egress
+  SsmCouchbaseEgressIp:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/lambda_egress_ip
+      Type: String
+      Value: !GetAtt CouchbaseEgressEip.PublicIp
+  SsmCouchbaseEgressSubnet:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/lambda_subnet_id
+      Type: String
+      Value: !Ref CouchbaseEgressSubnet
+  SsmCouchbaseEgressSecurityGroup:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/lambda_sg_id
+      Type: String
+      Value: !GetAtt CouchbaseEgressSecurityGroup.GroupId
+
+Outputs:
+
+  AgentGatewayUrl:
+    Description: MCP URL of the Cognito-JWT agent gateway
+    Value: !GetAtt AgentGateway.GatewayUrl
+
+  AgentGatewayArn:
+    Description: ARN of the Cognito-JWT agent gateway
+    Value: !GetAtt AgentGateway.GatewayArn
+
+  HarnessGatewayArn:
+    Description: ARN of the IAM-auth Harness gateway
+    Value: !GetAtt HarnessGateway.GatewayArn
+
+  CognitoUserPoolId:
+    Description: AnyCompany agent Cognito user pool ID
+    Value: !Ref AgentUserPool
+
+  CognitoClientId:
+    Description: AnyCompany chatbot Cognito app client ID
+    Value: !Ref AgentUserPoolClient
+
+  GatewayExecutionRoleArn:
+    Description: ARN of the AgentCore gateway execution role
+    Value: !GetAtt GatewayExecutionRole.Arn
+
+  RegistryId:
+    Description: AnyCompany AgentCore Registry ID
+    Value: !GetAtt RegistryResource.RegistryId
+
+  RegistryArn:
+    Description: AnyCompany AgentCore Registry ARN
+    Value: !GetAtt RegistryResource.RegistryArn

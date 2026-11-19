@@ -1,0 +1,79 @@
+[
+  {
+    "name": "refund_policy",
+    "description": "Retrieve refund policy information from the knowledge base. Use when the customer asks about return windows, eligible categories, or policy rules.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "The policy question to look up"
+        }
+      },
+      "required": [
+        "question"
+      ]
+    }
+  },
+  {
+    "name": "check_eligible",
+    "description": "Check whether an order is eligible for a refund based on status, reason, and damage evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "string",
+          "description": "Order ID (e.g. ORD-12345)"
+        },
+        "order_status": {
+          "type": "string",
+          "description": "Current status (delivered, shipped, etc.)"
+        },
+        "item": {
+          "type": "string",
+          "description": "Product name"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Reason for refund request"
+        },
+        "damage_level": {
+          "type": "string",
+          "description": "Damage severity (minor/moderate/severe)"
+        }
+      },
+      "required": [
+        "order_id",
+        "order_status",
+        "item",
+        "reason"
+      ]
+    }
+  },
+  {
+    "name": "process_refund",
+    "description": "Process an approved refund. Only call after eligibility is confirmed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "string",
+          "description": "Order ID"
+        },
+        "refund_amount": {
+          "type": "number",
+          "description": "Dollar amount to refund"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Reason for the refund"
+        }
+      },
+      "required": [
+        "order_id",
+        "refund_amount",
+        "reason"
+      ]
+    }
+  }
+]

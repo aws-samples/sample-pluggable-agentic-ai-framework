@@ -1,0 +1,19 @@
+[
+  {
+    "name": "check_order_details",
+    "description": "Look up order details or customer orders from the database. Returns order ID, status, product name, order amount, and customer tier. Provide at least one parameter: order_id for a specific order or customer_id for all orders of a customer.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "string",
+          "description": "The order identifier (e.g. ORD-10001). Returns details for that specific order."
+        },
+        "customer_id": {
+          "type": "string",
+          "description": "The customer identifier (e.g. CUST-789). Returns all orders for that customer."
+        }
+      }
+    }
+  }
+]

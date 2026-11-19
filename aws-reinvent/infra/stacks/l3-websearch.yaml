@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  L3 Web search — Research Agent runtime role and the Brave Search MCP server (image pre-built in the background, plus its runtime role).
+  Nested stack of agent-stack.yaml; deploy the parent, not this template.
+
+# The Research Agent (l3-orchestration/2_specialist_agents.ipynb, Step 4) uses one of three
+# web-search providers, each a target on the AgentCore Gateway. Only Brave needs
+# infrastructure of its own (a container on AgentCore Runtime), built here so
+# 1_gateway_tools.ipynb (Step 4) just starts it. The Gateway-role permissions for all three providers
+# live with the Gateway role in l3-orchestration.yaml. No resources are shared
+# with the other nested stacks, so this deploys in parallel with them.
+
+Parameters:
+  ParentStackName:
+    Type: String
+    Description: Name of the parent agent-stack. Used in physical resource names so they stay
+      stable across nested stacks (a nested stack's own name is auto-generated).
+
+Resources:
+
+  # --- Execution role for the Research A2A agent runtime ---
+  # 2_specialist_agents.ipynb launches the runtime with this role. Same permissions as
+  # the Order/Refund roles: the agent reaches its web-search tool through the
+  # Cognito-JWT Gateway (no extra IAM), and reads its provider choice from SSM.
+  ResearchAgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentCoreResearchAgentA2ARole
+      Description: Runtime role for Research A2A Agent
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResearchAgentRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInference
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - "arn:aws:bedrock:*:*:inference-profile/*"
+              # ecr:GetAuthorizationToken has no resource-level permissions, so AWS
+              # requires Resource: '*'. Image pulls below are scoped to bedrock-agentcore-* repos.
+              - Sid: ECRAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRAgentImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: "arn:aws:ecr:*:*:repository/bedrock-agentcore-*"
+              # X-Ray tracing requires Resource: '*'
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              # PutMetricData requires Resource: '*'; the namespace condition scopes it.
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: CloudWatchLogsGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: CloudWatchLogsDescribeGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:*"
+              - Sid: AgentCoreWorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+              - Sid: SSMConfig
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: "arn:aws:ssm:*:*:parameter/anycompany/agentcore/*"
+
+  SsmResearchAgentRuntimeRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/research_agent_runtime_role_arn
+      Type: String
+      Value: !GetAtt ResearchAgentRuntimeRole.Arn
+
+  # ===========================================================================
+  # Brave Search MCP server — container image pre-built in the background
+  #
+  # One of the three web-search options for the Research Agent. The Brave MCP
+  # server is open source (npm @brave/brave-search-mcp-server) and runs on its
+  # own AgentCore Runtime (arm64). Building the image takes several minutes, so
+  # the stack builds it in the background — exactly like the Strands Decider —
+  # and 1_gateway_tools.ipynb (Step 4) only creates the runtime + Gateway target (~1 min):
+  #   custom resource -> CodeBuild (arm64) -> ECR
+  # Progress is published to SSM:
+  #   /anycompany/agentcore/brave_mcp_build_status   BUILDING | READY | FAILED: <reason>
+  #   /anycompany/agentcore/brave_mcp_image_uri      set when READY
+  #
+  # The Brave API key is NOT baked into the image or the runtime config: the
+  # container reads it from Secrets Manager (anycompany/brave-search-api-key)
+  # at startup, using the runtime role below.
+  # ===========================================================================
+  BraveMcpImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: anycompany-brave-mcp-server
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # Role the Brave MCP runtime runs as: pull its image, read the Brave key, write logs.
+  BraveMcpRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentCoreBraveMcpRuntimeRole
+      Description: Runtime role for the Brave Search MCP server
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BraveMcpRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadBraveSecretOnly
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:anycompany/brave-search-api-key-*"
+              # ecr:GetAuthorizationToken has no resource-level permissions, so AWS
+              # requires Resource: '*'. Image pulls below are scoped to the Brave MCP repo.
+              - Sid: ECRAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PullImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !GetAtt BraveMcpImageRepository.Arn
+              - Sid: CloudWatchLogsGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: CloudWatchLogsDescribeGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:*"
+              - Sid: AgentCoreWorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+
+  SsmBraveMcpRuntimeRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /anycompany/agentcore/brave_mcp_runtime_role_arn
+      Type: String
+      Value: !GetAtt BraveMcpRuntimeRole.Arn
+
+  BraveMcpBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: BraveMcpBuild
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ParentStackName}-brave-mcp-build*"
+              - Sid: PushImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt BraveMcpImageRepository.Arn
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PublishResult
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/brave_mcp_*"
+
+  BraveMcpBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ParentStackName}-brave-mcp-build"
+      Description: Builds the Brave Search MCP server image (arm64) for AgentCore Runtime.
+      ServiceRole: !GetAtt BraveMcpBuildRole.Arn
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 60
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        # AgentCore Runtime runs arm64 containers.
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: IMAGE_REPO_URI, Value: !GetAtt BraveMcpImageRepository.RepositoryUri }
+          - { Name: BRAVE_MCP_VERSION, Value: "2.0.6" }
+          - { Name: SECRETS_SDK_VERSION, Value: "3.1158.0" }
+          - { Name: SSM_PREFIX, Value: /anycompany/agentcore }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  mkdir -p /tmp/brave && cd /tmp/brave
+                  # Entry point: read the Brave key from Secrets Manager, then start the server.
+                  # The key is never in the image, the runtime config, or the logs.
+                  cat > entrypoint.mjs <<'EOF'
+                  import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+                  import { spawn } from "node:child_process";
+                  if (!process.env.BRAVE_API_KEY) {
+                    const id = process.env.BRAVE_SECRET_ID;
+                    if (!id) { console.error("BRAVE_SECRET_ID is not set"); process.exit(1); }
+                    const out = await new SecretsManagerClient({}).send(new GetSecretValueCommand({ SecretId: id }));
+                    process.env.BRAVE_API_KEY = (out.SecretString || "").trim();
+                  }
+                  if (!process.env.BRAVE_API_KEY) { console.error("The Brave API key secret is empty"); process.exit(1); }
+                  const child = spawn("brave-search-mcp-server", [], { stdio: "inherit", env: process.env });
+                  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => child.kill(sig));
+                  child.on("exit", (code, sig) => process.exit(code ?? (sig ? 1 : 0)));
+                  EOF
+                  cat > Dockerfile <<'EOF'
+                  FROM public.ecr.aws/docker/library/node:22-slim
+                  ARG BRAVE_MCP_VERSION
+                  ARG SECRETS_SDK_VERSION
+                  RUN npm install -g --no-audit --no-fund "@brave/brave-search-mcp-server@${BRAVE_MCP_VERSION}" \
+                   && mkdir -p /app && cd /app && npm init -y >/dev/null \
+                   && npm install --no-audit --no-fund "@aws-sdk/client-secrets-manager@${SECRETS_SDK_VERSION}"
+                  COPY entrypoint.mjs /app/entrypoint.mjs
+                  # AgentCore MCP contract: listen on 0.0.0.0:8000, serve /mcp, stateless HTTP.
+                  ENV BRAVE_MCP_TRANSPORT=http \
+                      BRAVE_MCP_HOST=0.0.0.0 \
+                      BRAVE_MCP_PORT=8000 \
+                      BRAVE_MCP_STATELESS=true \
+                      BRAVE_MCP_LOG_LEVEL=info \
+                      BRAVE_MCP_ENABLED_TOOLS="brave_web_search"
+                  WORKDIR /app
+                  USER node
+                  EXPOSE 8000
+                  CMD ["node", "/app/entrypoint.mjs"]
+                  EOF
+                  REGISTRY="${IMAGE_REPO_URI%%/*}"
+                  aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+                  IMAGE_URI="$IMAGE_REPO_URI:$BRAVE_MCP_VERSION"
+                  docker build --platform linux/arm64 \
+                    --build-arg BRAVE_MCP_VERSION="$BRAVE_MCP_VERSION" \
+                    --build-arg SECRETS_SDK_VERSION="$SECRETS_SDK_VERSION" \
+                    -t "$IMAGE_URI" .
+                  docker push "$IMAGE_URI"
+                  echo "$IMAGE_URI" > /tmp/image_uri
+            post_build:
+              commands:
+                - |
+                  if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ] && [ -s /tmp/image_uri ]; then
+                    aws ssm put-parameter --name "$SSM_PREFIX/brave_mcp_image_uri" --type String --overwrite \
+                      --value "$(cat /tmp/image_uri)"
+                    aws ssm put-parameter --name "$SSM_PREFIX/brave_mcp_build_status" --type String --overwrite \
+                      --value READY
+                  else
+                    aws ssm put-parameter --name "$SSM_PREFIX/brave_mcp_build_status" --type String --overwrite \
+                      --value "FAILED: see CodeBuild build $CODEBUILD_BUILD_ID"
+                  fi
+
+  BraveMcpBuildTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BraveMcpBuildTrigger
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartAndStopBuilds
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:ListBuildsForProject
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource: !GetAtt BraveMcpBuildProject.Arn
+              - Sid: StatusParams
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/anycompany/agentcore/brave_mcp_*"
+
+  BraveMcpBuildTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ParentStackName}-brave-mcp-build-trigger"
+      Description: Starts the Brave MCP image build on Create; stops it and clears its SSM status on Delete.
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt BraveMcpBuildTriggerRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          PARAMS = ("brave_mcp_build_status", "brave_mcp_image_uri")
+
+
+          def _send(event, context, status, data=None, physical=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": "See CloudWatch Log: " + context.log_stream_name,
+                  "PhysicalResourceId": physical or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print("CFN send failed:", str(e))
+
+
+          def _start(p):
+              boto3.client("ssm").put_parameter(Name=f"{p['SsmPrefix']}/brave_mcp_build_status",
+                                                Value="BUILDING", Type="String", Overwrite=True)
+              build = boto3.client("codebuild").start_build(projectName=p["BuildProject"])["build"]
+              print("started build", build["id"])
+              return build["id"]
+
+
+          def _stop_and_clear(p):
+              cb = boto3.client("codebuild")
+              ids = cb.list_builds_for_project(projectName=p["BuildProject"]).get("ids", [])[:100]
+              if ids:
+                  for b in cb.batch_get_builds(ids=ids).get("builds", []):
+                      if b.get("buildStatus") == "IN_PROGRESS":
+                          cb.stop_build(id=b["id"])
+              try:
+                  boto3.client("ssm").delete_parameters(Names=[f"{p['SsmPrefix']}/{n}" for n in PARAMS])
+              except ClientError as e:
+                  print("delete ssm:", e)
+
+
+          def handler(event, context):
+              rt = event.get("RequestType")
+              p = event.get("ResourceProperties", {})
+              old = event.get("OldResourceProperties", {})
+              physical = event.get("PhysicalResourceId") or "brave-mcp-build"
+              try:
+                  if rt == "Create":
+                      _send(event, context, "SUCCESS", {"BuildId": _start(p)}, physical)
+                  elif rt == "Update":
+                      # Rebuild only when the pinned server version changes.
+                      if p.get("BraveMcpVersion") != old.get("BraveMcpVersion"):
+                          _send(event, context, "SUCCESS", {"BuildId": _start(p)}, physical)
+                      else:
+                          _send(event, context, "SUCCESS", {}, physical)
+                  else:
+                      _stop_and_clear(p)
+                      _send(event, context, "SUCCESS", {}, physical)
+              except Exception as e:
+                  print("ERROR:", e)
+                  # Never fail the stack on the background build; the notebook reads
+                  # brave_mcp_build_status and explains. Never block deletion either.
+                  _send(event, context, "SUCCESS", {"Error": str(e)[:900]}, physical)
+
+  # Returns as soon as the build starts, so stack creation does not wait for it.
+  # Delete runs before the repository and roles are removed (it references them).
+  BraveMcpBuildTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt BraveMcpBuildTriggerFunction.Arn
+      ServiceTimeout: 120
+      BuildProject: !Ref BraveMcpBuildProject
+      ImageRepository: !Ref BraveMcpImageRepository
+      BraveMcpVersion: "2.0.6"
+      SsmPrefix: /anycompany/agentcore
+
+Outputs:
+  ResearchAgentRuntimeRoleArn:
+    Description: Execution role for the Research A2A agent runtime
+    Value: !GetAtt ResearchAgentRuntimeRole.Arn
+  BraveMcpImageRepositoryUri:
+    Description: ECR repository holding the pre-built Brave Search MCP server image
+    Value: !GetAtt BraveMcpImageRepository.RepositoryUri
+  BraveMcpRuntimeRoleArn:
+    Description: Execution role for the Brave Search MCP server runtime
+    Value: !GetAtt BraveMcpRuntimeRole.Arn

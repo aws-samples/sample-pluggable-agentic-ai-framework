@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="62 8 216 248" width="216" height="248" role="img" aria-label="Pluggable Agentic AI Framework logo">
+<!-- Pluggable Agentic AI Framework logo.
+     A stack of framework layers with one layer sliding out (each layer is a
+     swappable provider slot), topped by an orchestrator hub delegating to three
+     specialist agents. Colors match the Partner Selection UI. -->
+<defs>
+  <linearGradient id="netGrad" gradientUnits="userSpaceOnUse" x1="0" y1="20" x2="0" y2="70">
+    <stop offset="0" stop-color="#14b8a6"/><stop offset="1" stop-color="#0891b2"/>
+  </linearGradient>
+  <radialGradient id="hubGlow" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#22d3ee" stop-opacity=".22"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+  </radialGradient>
+  <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur stdDeviation="1.5" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>
+<circle cx="148" cy="56" r="60" fill="url(#hubGlow)"/>
+<g stroke-linejoin="round"><polygon points="76,212 148,234 148,250 76,228" fill="#3b82f6"/><polygon points="148,234 220,212 220,228 148,250" fill="#2563eb"/><polygon points="148,190 220,212 148,234 76,212" fill="#93c5fd"/><polyline points="76,212 148,234 220,212" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="1.4"/><polygon points="76,182 148,204 148,220 76,198" fill="#0ea5e9"/><polygon points="148,204 220,182 220,198 148,220" fill="#0284c7"/><polygon points="148,160 220,182 148,204 76,182" fill="#7dd3fc"/><polyline points="76,182 148,204 220,182" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="1.4"/><polygon points="120,174 192,196 192,212 120,190" fill="#7c6cff"/><polygon points="192,196 264,174 264,190 192,212" fill="#5b4be0"/><polygon points="192,152 264,174 192,196 120,174" fill="#b4a9ff"/><polyline points="120,174 192,196 264,174" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="1.4"/><polygon points="76,122 148,144 148,160 76,138" fill="#14b8a6"/><polygon points="148,144 220,122 220,138 148,160" fill="#0d9488"/><polygon points="148,100 220,122 148,144 76,122" fill="#5eead4"/><polyline points="76,122 148,144 220,122" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="1.4"/></g>
+<g filter="url(#glow)" stroke-linecap="round"><line x1="148" y1="66" x2="148" y2="100" stroke="#14b8a6" stroke-width="2.6" stroke-dasharray="3 4"/><line x1="148" y1="66" x2="94" y2="48" stroke="url(#netGrad)" stroke-width="3"/><line x1="148" y1="66" x2="148" y2="28" stroke="url(#netGrad)" stroke-width="3"/><line x1="148" y1="66" x2="202" y2="48" stroke="url(#netGrad)" stroke-width="3"/><line x1="94" y1="48" x2="148" y2="28" stroke="url(#netGrad)" stroke-width="2.2" opacity=".7"/><line x1="148" y1="28" x2="202" y2="48" stroke="url(#netGrad)" stroke-width="2.2" opacity=".7"/><circle cx="94" cy="48" r="7" fill="url(#netGrad)"/><circle cx="148" cy="28" r="7" fill="url(#netGrad)"/><circle cx="202" cy="48" r="7" fill="url(#netGrad)"/><circle cx="148" cy="66" r="11" fill="#0891b2" stroke="#ffffff" stroke-width="2.5"/></g>
+</svg>

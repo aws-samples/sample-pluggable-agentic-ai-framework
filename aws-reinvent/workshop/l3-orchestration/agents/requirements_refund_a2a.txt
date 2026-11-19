@@ -1,0 +1,22 @@
+boto3==1.43.0
+bedrock-agentcore==1.14.0
+strands-agents[a2a,litellm]==1.43.0
+strands-agents-tools==0.2.0
+fastapi==0.136.3
+uvicorn==0.34.2
+pyyaml==6.0.3
+httpx==0.28.1
+litellm==1.83.7
+# App-owned Datadog OTLP/HTTP trace pipeline (agents/dd_otel.py, Datadog branch).
+# strands-agents==1.43.0 requires opentelemetry-api/-sdk >=1.30.0,<2.0.0 (core)
+# and the exporter >=1.30.0,<2.0.0 (its 'otel' extra, NOT pulled by
+# [a2a,litellm]); OTel stable packages share one version, so these three MUST
+# stay identical.
+# Scope note: these pins govern the DATADOG container. In CloudWatch mode the
+# generated Dockerfile installs aws-opentelemetry-distro AFTER requirements,
+# which re-pins OTel to its own matched set — so the CloudWatch image ends up on
+# that version, not necessarily 1.39.1. That is expected and harmless (the
+# app-owned exporter is imported only on the Datadog branch).
+opentelemetry-api==1.39.1
+opentelemetry-sdk==1.39.1
+opentelemetry-exporter-otlp-proto-http==1.39.1
