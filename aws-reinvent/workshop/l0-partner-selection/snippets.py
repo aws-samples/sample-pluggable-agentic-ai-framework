@@ -239,6 +239,41 @@ LAYERS = [
                     },
                 ],
             },
+            "CloudZero": {
+                "value": "cloudzero",
+                "kind": "key",
+                "tagline": "Model-call spans straight to CloudZero",
+                "description": "<b>Every specialist model call as a CloudZero AI Signals "
+                               "event.</b> CloudZero receives one span per model call (model, "
+                               "tokens and cost, no prompt text) from the Order, "
+                               "Refund and Research agents, sent directly by LiteLLM "
+                               "and tagged with your username. Everything else, "
+                               "including the orchestrator, and all logs stay on "
+                               "CloudWatch.",
+                # Portal link shown in the UI so participants can get their keys.
+                "portal": {
+                    "url": "https://<CZ_VENDING_PAGE>",
+                    "label": "Get your CloudZero API key & username",
+                },
+                "credentials": [
+                    {
+                        "key": "api_key",
+                        # Own path (like config/perplexity, config/brave), so it
+                        # never collides with Datadog's config/observability/api_key.
+                        "param": f"{CONFIG_PREFIX}/cloudzero/api_key",
+                        "label": "CloudZero API key",
+                        "placeholder": "CloudZero ingest API key",
+                        "secure": True,
+                    },
+                    {
+                        "key": "username",
+                        "param": f"{CONFIG_PREFIX}/cloudzero/username",
+                        "label": "CloudZero username",
+                        "placeholder": "Your CloudZero workshop username",
+                        "secure": False,
+                    },
+                ],
+            },
         },
     },
     {
@@ -392,12 +427,38 @@ def _obs_snip_datadog() -> str:
     ])
 
 
+def _obs_snip_cloudzero() -> str:
+    return "\n".join([
+        "# ┌─ L3 Agent Observability · CloudZero · Confirm",
+        "# │ Paste into the empty 'Step 6' cell in 1_gateway_tools.ipynb and run.",
+        "# │ The Order, Refund and Research agents need the CloudZero API key and",
+        "# │ username when they deploy, so this checks them now. The key is never printed.",
+        "# └────────────────────────────────────────────────────────────",
+        "from helpers.observability import get_observability_provider, cloudzero_otel_env",
+        "",
+        "OBS_PROVIDER = get_observability_provider(ssm, SSM_PREFIX)",
+        "if OBS_PROVIDER != \"cloudzero\":",
+        "    raise RuntimeError(\"CloudZero is not saved as the provider. Save your CloudZero API key and username \"",
+        "                       \"in the Partner Selection UI (Orchestration -> Agent Observability), then re-run this cell.\")",
+        "try:",
+        "    # Also rejects malformed values (the error names the parameter, never the key).",
+        "    cloudzero_otel_env(ssm, \"anycompany-check\", SSM_PREFIX)",
+        "except ssm.exceptions.ParameterNotFound:",
+        "    raise RuntimeError(\"CloudZero is selected but its API key or username is missing. Save them in the \"",
+        "                       \"Partner Selection UI (Orchestration -> Agent Observability), then re-run this cell.\")",
+        "print(\"Order, Refund and Research agents will send their model-call spans to: cloudzero\")",
+        "print(\"The orchestrator and all other traces and logs stay on CloudWatch.\")",
+    ])
+
+
 def observability_snippet(provider: str, stage_id: str) -> str:
     """Return the per-provider Confirm block for the Agent Observability layer."""
     if provider.startswith("CloudWatch"):
         return _obs_snip_cloudwatch()
     if provider == "Datadog":
         return _obs_snip_datadog()
+    if provider == "CloudZero":
+        return _obs_snip_cloudzero()
     return ""
 
 
