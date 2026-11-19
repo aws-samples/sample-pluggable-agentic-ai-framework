@@ -6,7 +6,7 @@ the full lifecycle.
 
 Provisions the SageMaker Studio environment, the **data layer** (DynamoDB
 `CustomerOrders` + sample data), the **L3 orchestration** layer (Cognito pool
-+ test users, AgentCore gateways, Agent Registry, SSM handoffs), the **L5
+test users, AgentCore gateways, Agent Registry, SSM handoffs), the **L5
 decision model** (Strands Decider on SageMaker), and **L6 observability** so
 participants skip the deterministic setup.
 
